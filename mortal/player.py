@@ -11,6 +11,11 @@ from libriichi.stat import Stat
 from libriichi.arena import OneVsThree
 from config import config
 
+def _resolve_amp_dtype(cfg):
+    """Resolve amp_dtype from config, defaulting to float16."""
+    dtype_str = cfg.get('amp_dtype', 'float16')
+    return torch.bfloat16 if dtype_str == 'bfloat16' else torch.float16
+
 class TestPlayer:
     def __init__(self):
         baseline_cfg = config['baseline']['test']
@@ -36,10 +41,12 @@ class TestPlayer:
             version = version,
             device = device,
             enable_amp = True,
+            amp_dtype = _resolve_amp_dtype(cfg['control']),
             enable_rule_based_agari_guard = True,
             name = 'baseline',
         )
         self.chal_version = config['control']['version']
+        self.chal_amp_dtype = _resolve_amp_dtype(config['control'])
         self.log_dir = path.abspath(config['test_play']['log_dir'])
 
     def test_play(self, seed_count, mortal, dqn, device):
@@ -51,6 +58,7 @@ class TestPlayer:
             version = self.chal_version,
             device = device,
             enable_amp = True,
+            amp_dtype = self.chal_amp_dtype,
             name = 'mortal',
         )
 
@@ -97,6 +105,7 @@ class TrainPlayer:
             version = version,
             device = device,
             enable_amp = True,
+            amp_dtype = _resolve_amp_dtype(cfg['control']),
             enable_rule_based_agari_guard = True,
             name = 'baseline',
         )
@@ -105,6 +114,7 @@ class TrainPlayer:
         logging.info(f'using profile {profile}')
         cfg = config['train_play'][profile]
         self.chal_version = config['control']['version']
+        self.chal_amp_dtype = _resolve_amp_dtype(config['control'])
         self.log_dir = path.abspath(cfg['log_dir'])
         self.train_key = secrets.randbits(64)
         self.train_seed = 10000
@@ -129,6 +139,7 @@ class TrainPlayer:
             top_p = self.top_p,
             device = device,
             enable_amp = True,
+            amp_dtype = self.chal_amp_dtype,
             name = 'trainee',
         )
 

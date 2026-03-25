@@ -9,6 +9,10 @@ from engine import MortalEngine
 from libriichi.arena import OneVsThree
 from config import config
 
+def _resolve_amp_dtype(cfg_control):
+    dtype_str = cfg_control.get('amp_dtype', 'float16')
+    return torch.bfloat16 if dtype_str == 'bfloat16' else torch.float16
+
 def main():
     cfg = config['1v3']
     games_per_iter = cfg['games_per_iter']
@@ -43,6 +47,7 @@ def main():
             version = version,
             device = torch.device(cfg['champion']['device']),
             enable_amp = cfg['champion']['enable_amp'],
+            amp_dtype = _resolve_amp_dtype(cham_cfg['control']),
             enable_rule_based_agari_guard = cfg['champion']['enable_rule_based_agari_guard'],
             name = cfg['champion']['name'],
         )
@@ -66,6 +71,7 @@ def main():
         version = version,
         device = torch.device(cfg['challenger']['device']),
         enable_amp = cfg['challenger']['enable_amp'],
+        amp_dtype = _resolve_amp_dtype(chal_cfg['control']),
         enable_rule_based_agari_guard = cfg['challenger']['enable_rule_based_agari_guard'],
         name = cfg['challenger']['name'],
     )

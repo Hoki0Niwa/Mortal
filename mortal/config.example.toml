@@ -12,6 +12,7 @@ tensorboard_dir = '/path/to/dir'
 device = 'cuda:0'
 enable_cudnn_benchmark = false
 enable_amp = false
+amp_dtype = 'float16'           # 'float16' or 'bfloat16'
 enable_compile = false
 
 batch_size = 512

@@ -44,6 +44,8 @@ def train():
     device = torch.device(config['control']['device'])
     torch.backends.cudnn.benchmark = config['control']['enable_cudnn_benchmark']
     enable_amp = config['control']['enable_amp']
+    amp_dtype_str = config['control'].get('amp_dtype', 'float16')
+    amp_dtype = torch.bfloat16 if amp_dtype_str == 'bfloat16' else torch.float16
     enable_compile = config['control']['enable_compile']
 
     pts = config['env']['pts']
@@ -93,7 +95,8 @@ def train():
     ]
     optimizer = optim.AdamW(param_groups, lr=1, weight_decay=0, betas=betas, eps=eps)
     scheduler = LinearWarmUpCosineAnnealingLR(optimizer, **config['optim']['scheduler'])
-    scaler = GradScaler(device.type, enabled=enable_amp)
+    # GradScaler is not needed for bfloat16 (wider dynamic range)
+    scaler = GradScaler(device.type, enabled=enable_amp and amp_dtype == torch.float16)
     test_player = TestPlayer()
     best_perf = {
         'avg_rank': 4.,
@@ -228,7 +231,7 @@ def train():
             q_target_mc = gamma ** steps_to_done * kyoku_rewards
             q_target_mc = q_target_mc.to(torch.float32)
 
-            with torch.autocast(device.type, enabled=enable_amp):
+            with torch.autocast(device.type, dtype=amp_dtype, enabled=enable_amp):
                 phi = mortal(obs)
                 q_out = dqn(phi, masks)
                 q = q_out[range(batch_size), actions]
