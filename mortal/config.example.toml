@@ -4,6 +4,7 @@
 [control]
 version = 4
 online = false
+top_k = 5
 
 state_file = '/path/to/mortal.pth'
 best_state_file = '/path/to/best.pth'

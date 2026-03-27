@@ -106,6 +106,9 @@ def train():
     steps = 0
     state_file = config['control']['state_file']
     best_state_file = config['control']['best_state_file']
+    top_k = config['control'].get('top_k', 5)
+    top_k_dir = path.join(path.dirname(best_state_file), 'candidates')
+    top_checkpoints = []  # list of {'avg_rank', 'avg_pt', 'steps', 'filepath'}
     if path.exists(state_file):
         state = torch.load(state_file, weights_only=True, map_location=device)
         timestamp = datetime.fromtimestamp(state['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
@@ -119,6 +122,8 @@ def train():
         scaler.load_state_dict(state['scaler'])
         best_perf = state['best_perf']
         steps = state['steps']
+        if 'top_checkpoints' in state:
+            top_checkpoints = [c for c in state['top_checkpoints'] if path.exists(c['filepath'])]
 
     optimizer.zero_grad(set_to_none=True)
     mse = nn.MSELoss()
@@ -308,6 +313,7 @@ def train():
                     'steps': steps,
                     'timestamp': datetime.now().timestamp(),
                     'best_perf': best_perf,
+                    'top_checkpoints': top_checkpoints,
                     'config': config,
                 }
                 torch.save(state, state_file)
@@ -381,6 +387,29 @@ def train():
                             f'saving to {best_state_file}'
                         )
                         shutil.copy(state_file, best_state_file)
+
+                    # top-k candidate checkpoint management
+                    if top_k > 0:
+                        worst_rank = max(c['avg_rank'] for c in top_checkpoints) if top_checkpoints else float('inf')
+                        if len(top_checkpoints) < top_k or stat.avg_rank < worst_rank:
+                            os.makedirs(top_k_dir, exist_ok=True)
+                            ckpt_path = path.join(top_k_dir, f'candidate_{steps}.pth')
+                            shutil.copy(state_file, ckpt_path)
+                            top_checkpoints.append({
+                                'avg_rank': stat.avg_rank,
+                                'avg_pt': avg_pt,
+                                'steps': steps,
+                                'filepath': ckpt_path,
+                            })
+                            if len(top_checkpoints) > top_k:
+                                worst = max(top_checkpoints, key=lambda c: c['avg_rank'])
+                                top_checkpoints.remove(worst)
+                                if path.exists(worst['filepath']):
+                                    os.remove(worst['filepath'])
+                            ranked = sorted(top_checkpoints, key=lambda c: c['avg_rank'])
+                            logging.info(f'top-{top_k} candidates:')
+                            for i, c in enumerate(ranked):
+                                logging.info(f'  #{i+1}: rank={c["avg_rank"]:.6}, pt={c["avg_pt"]:.6}, step={c["steps"]}')
                     if online:
                         # BUG: This is a bug with unknown reason. When training
                         # in online mode, the process will get stuck here. This
