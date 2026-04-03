@@ -31,6 +31,8 @@ boltzmann_epsilon = 0.005
 boltzmann_temp = 0.05
 top_p = 1.0
 repeats = 1
+opponent_pool_dir = ''          # past checkpoint directory (empty = disabled)
+opponent_pool_prob = 0.0        # probability of using pool opponent (0.0 = always baseline)
 
 [test_play]
 games = 3000

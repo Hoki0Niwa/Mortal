@@ -4,6 +4,7 @@ import os
 import shutil
 import secrets
 import logging
+import random
 from os import path
 from model import Brain, DQN
 from engine import MortalEngine
@@ -127,6 +128,44 @@ class TrainPlayer:
         self.repeats = cfg['repeats']
         self.repeat_counter = 0
 
+        self.opponent_pool_dir = cfg.get('opponent_pool_dir', '')
+        self.opponent_pool_prob = cfg.get('opponent_pool_prob', 0.0)
+
+    def _load_pool_opponent(self, device):
+        pool_dir = self.opponent_pool_dir
+        if not pool_dir or not path.isdir(pool_dir):
+            return None
+        candidates = [f for f in os.listdir(pool_dir) if f.endswith('.pth')]
+        if not candidates:
+            return None
+        chosen = path.join(pool_dir, random.choice(candidates))
+        try:
+            state = torch.load(chosen, weights_only=True, map_location=torch.device('cpu'))
+            cfg = state['config']
+            version = cfg['control'].get('version', 1)
+            conv_channels = cfg['resnet']['conv_channels']
+            num_blocks = cfg['resnet']['num_blocks']
+            pool_mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks).eval()
+            pool_dqn = DQN(version=version).eval()
+            pool_mortal.load_state_dict(state['mortal'])
+            pool_dqn.load_state_dict(state['current_dqn'])
+            engine = MortalEngine(
+                pool_mortal,
+                pool_dqn,
+                is_oracle=False,
+                version=version,
+                device=device,
+                enable_amp=True,
+                amp_dtype=_resolve_amp_dtype(cfg['control']),
+                enable_rule_based_agari_guard=True,
+                name='pool',
+            )
+            logging.info(f'using pool opponent: {path.basename(chosen)}')
+            return engine
+        except Exception as e:
+            logging.warning(f'failed to load pool opponent {chosen}: {e}')
+            return None
+
     def train_play(self, mortal, dqn, device):
         torch.backends.cudnn.benchmark = False
         engine_chal = MortalEngine(
@@ -143,6 +182,12 @@ class TrainPlayer:
             name = 'trainee',
         )
 
+        opponent = self.baseline_engine
+        if self.opponent_pool_prob > 0 and random.random() < self.opponent_pool_prob:
+            pool_opponent = self._load_pool_opponent(device)
+            if pool_opponent is not None:
+                opponent = pool_opponent
+
         if path.isdir(self.log_dir):
             shutil.rmtree(self.log_dir)
 
@@ -152,7 +197,7 @@ class TrainPlayer:
         )
         rankings = env.py_vs_py(
             challenger = engine_chal,
-            champion = self.baseline_engine,
+            champion = opponent,
             seed_start = (self.train_seed, self.train_key),
             seed_count = self.seed_count,
         )
