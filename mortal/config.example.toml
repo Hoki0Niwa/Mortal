@@ -36,6 +36,7 @@ opponent_pool_prob = 0.0        # probability of using pool opponent (0.0 = alwa
 
 [test_play]
 games = 3000
+aggregate_runs = 1              # run N independent test-play batches per evaluation
 log_dir = '/path/to/test_play'
 
 [dataset]

@@ -49,37 +49,58 @@ class TestPlayer:
         self.chal_version = config['control']['version']
         self.chal_amp_dtype = _resolve_amp_dtype(config['control'])
         self.log_dir = path.abspath(config['test_play']['log_dir'])
+        self.aggregate_runs = max(1, int(config['test_play'].get('aggregate_runs', 1)))
 
     def test_play(self, seed_count, mortal, dqn, device):
         torch.backends.cudnn.benchmark = False
-        engine_chal = MortalEngine(
-            mortal,
-            dqn,
-            is_oracle = False,
-            version = self.chal_version,
-            device = device,
-            enable_amp = True,
-            amp_dtype = self.chal_amp_dtype,
-            name = 'mortal',
-        )
+        try:
+            engine_chal = MortalEngine(
+                mortal,
+                dqn,
+                is_oracle = False,
+                version = self.chal_version,
+                device = device,
+                enable_amp = True,
+                amp_dtype = self.chal_amp_dtype,
+                name = 'mortal',
+            )
 
-        if path.isdir(self.log_dir):
-            shutil.rmtree(self.log_dir)
+            if path.isdir(self.log_dir):
+                shutil.rmtree(self.log_dir)
 
-        env = OneVsThree(
-            disable_progress_bar = False,
-            log_dir = self.log_dir,
-        )
-        env.py_vs_py(
-            challenger = engine_chal,
-            champion = self.baseline_engine,
-            seed_start = (10000, 0x2000),
-            seed_count = seed_count,
-        )
+            if self.aggregate_runs == 1:
+                run_log_dirs = [self.log_dir]
+                stat_dir = self.log_dir
+            else:
+                os.makedirs(self.log_dir, exist_ok=True)
+                run_log_dirs = [
+                    path.join(self.log_dir, f'run_{idx:04d}')
+                    for idx in range(self.aggregate_runs)
+                ]
+                stat_dir = self.log_dir
 
-        stat = Stat.from_dir(self.log_dir, 'mortal')
-        torch.backends.cudnn.benchmark = config['control']['enable_cudnn_benchmark']
-        return stat
+            for idx, run_log_dir in enumerate(run_log_dirs):
+                env = OneVsThree(
+                    disable_progress_bar = False,
+                    log_dir = run_log_dir,
+                )
+                seed_start = 10000 + idx * seed_count
+                env.py_vs_py(
+                    challenger = engine_chal,
+                    champion = self.baseline_engine,
+                    seed_start = (seed_start, 0x2000),
+                    seed_count = seed_count,
+                )
+
+            stat = Stat.from_dir(stat_dir, 'mortal')
+            if self.aggregate_runs > 1:
+                logging.info(
+                    f'aggregated {self.aggregate_runs} test-play runs '
+                    f'({stat.game:,} games)'
+                )
+            return stat
+        finally:
+            torch.backends.cudnn.benchmark = config['control']['enable_cudnn_benchmark']
 
 class TrainPlayer:
     def __init__(self):
