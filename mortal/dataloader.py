@@ -90,6 +90,8 @@ class FileDatasetsIter(IterableDataset):
                 at_kyoku = game.take_at_kyoku()
                 dones = game.take_dones()
                 apply_gamma = game.take_apply_gamma()
+                at_turns = game.take_at_turns()
+                shantens = game.take_shantens()
 
                 # per game
                 grp = game.take_grp()
@@ -120,6 +122,8 @@ class FileDatasetsIter(IterableDataset):
                         steps_to_done[i],
                         kyoku_rewards[at_kyoku[i]],
                         player_ranks[at_kyoku[i] + 1],
+                        at_turns[i],
+                        shantens[i],
                     ]
                     if self.oracle:
                         entry.insert(1, invisible_obs[i])
