@@ -106,7 +106,7 @@ class ResNet(nn.Module):
         return self.net(x)
 
 class Brain(nn.Module):
-    def __init__(self, *, conv_channels, num_blocks, is_oracle=False, version=1):
+    def __init__(self, *, conv_channels, num_blocks, is_oracle=False, version=1, norm='bn'):
         super().__init__()
         self.is_oracle = is_oracle
         self.version = version
@@ -133,6 +133,8 @@ class Brain(nn.Module):
                 pass
             case 3 | 4:
                 norm_builder = partial(nn.BatchNorm1d, conv_channels, momentum=0.01, eps=1e-3)
+                if norm == 'gn':
+                    norm_builder = partial(nn.GroupNorm, num_groups=32, num_channels=conv_channels, eps=1e-3)
             case _:
                 raise ValueError(f'Unexpected version {self.version}')
 
@@ -193,6 +195,17 @@ class AuxNet(nn.Module):
 
     def forward(self, x):
         return self.net(x).split(self.dims, dim=-1)
+
+class CategoricalPolicy(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(1024, 256)
+        self.fc2 = nn.Linear(256, ACTION_SPACE)
+
+    def forward(self, phi, mask):
+        phi = torch.tanh(self.fc1(phi))
+        phi = self.fc2(phi).masked_fill(~mask, -torch.inf)
+        return torch.softmax(phi, dim=-1)
 
 class DQN(nn.Module):
     def __init__(self, *, version=1):

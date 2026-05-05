@@ -6,7 +6,7 @@ import secrets
 import logging
 import random
 from os import path
-from model import Brain, DQN
+from model import Brain, DQN, CategoricalPolicy
 from engine import MortalEngine
 from libriichi.stat import Stat
 from libriichi.arena import OneVsThree
@@ -166,22 +166,46 @@ class TrainPlayer:
             version = cfg['control'].get('version', 1)
             conv_channels = cfg['resnet']['conv_channels']
             num_blocks = cfg['resnet']['num_blocks']
-            pool_mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks).eval()
-            pool_dqn = DQN(version=version).eval()
-            pool_mortal.load_state_dict(state['mortal'])
-            pool_dqn.load_state_dict(state['current_dqn'])
+
+            brain_state = state['mortal']
+            has_bn_stats = any('running_mean' in k for k in brain_state.keys())
+            norm = 'bn' if has_bn_stats else 'gn'
+
+            if 'policy_net' in state:
+                head_state = state['policy_net']
+            elif 'current_dqn' in state:
+                head_state = state['current_dqn']
+            else:
+                raise KeyError("checkpoint has neither 'policy_net' nor 'current_dqn'")
+
+            is_policy = ('fc1.weight' in head_state) and ('fc2.weight' in head_state)
+            if is_policy and version == 1:
+                raise ValueError('CategoricalPolicy does not support version 1 (latent dim mismatch)')
+
+            pool_mortal = Brain(
+                version=version,
+                conv_channels=conv_channels,
+                num_blocks=num_blocks,
+                norm=norm,
+            ).eval()
+            pool_head = CategoricalPolicy().eval() if is_policy else DQN(version=version).eval()
+
+            pool_mortal.load_state_dict(brain_state)
+            pool_head.load_state_dict(head_state)
+
+            head_kind = 'policy' if is_policy else 'dqn'
             engine = MortalEngine(
                 pool_mortal,
-                pool_dqn,
+                pool_head,
                 is_oracle=False,
                 version=version,
                 device=device,
                 enable_amp=True,
                 amp_dtype=_resolve_amp_dtype(cfg['control']),
                 enable_rule_based_agari_guard=True,
-                name='pool',
+                name=f'pool-{head_kind}-{norm}',
             )
-            logging.info(f'using pool opponent: {path.basename(chosen)}')
+            logging.info(f'using pool opponent ({head_kind}, norm={norm}): {path.basename(chosen)}')
             return engine
         except Exception as e:
             logging.warning(f'failed to load pool opponent {chosen}: {e}')
