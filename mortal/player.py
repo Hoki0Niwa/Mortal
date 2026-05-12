@@ -6,48 +6,27 @@ import secrets
 import logging
 import random
 from os import path
-from model import Brain, DQN, CategoricalPolicy
-from engine import MortalEngine
+from engine import MortalEngine, resolve_amp_dtype, build_engine_from_state
 from libriichi.stat import Stat
 from libriichi.arena import OneVsThree
 from config import config
-
-def _resolve_amp_dtype(cfg):
-    """Resolve amp_dtype from config, defaulting to float16."""
-    dtype_str = cfg.get('amp_dtype', 'float16')
-    return torch.bfloat16 if dtype_str == 'bfloat16' else torch.float16
 
 class TestPlayer:
     def __init__(self):
         baseline_cfg = config['baseline']['test']
         device = torch.device(baseline_cfg['device'])
 
-        state = torch.load(baseline_cfg['state_file'], weights_only=True, map_location=torch.device('cpu'))
-        cfg = state['config']
-        version = cfg['control'].get('version', 1)
-        conv_channels = cfg['resnet']['conv_channels']
-        num_blocks = cfg['resnet']['num_blocks']
-        stable_mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks).eval()
-        stable_dqn = DQN(version=version).eval()
-        stable_mortal.load_state_dict(state['mortal'])
-        stable_dqn.load_state_dict(state['current_dqn'])
-        if baseline_cfg['enable_compile']:
-            stable_mortal.compile()
-            stable_dqn.compile()
-
-        self.baseline_engine = MortalEngine(
-            stable_mortal,
-            stable_dqn,
-            is_oracle = False,
-            version = version,
-            device = device,
-            enable_amp = True,
-            amp_dtype = _resolve_amp_dtype(cfg['control']),
-            enable_rule_based_agari_guard = True,
-            name = 'baseline',
+        state = torch.load(baseline_cfg['state_file'], weights_only=False, map_location=torch.device('cpu'))
+        self.baseline_engine, info = build_engine_from_state(
+            state,
+            device=device,
+            enable_compile=baseline_cfg['enable_compile'],
+            name='baseline',
         )
+        logging.info(f"loaded test baseline ({info['head_kind']}, norm={info['norm']})")
+
         self.chal_version = config['control']['version']
-        self.chal_amp_dtype = _resolve_amp_dtype(config['control'])
+        self.chal_amp_dtype = resolve_amp_dtype(config['control'])
         self.log_dir = path.abspath(config['test_play']['log_dir'])
         self.aggregate_runs = max(1, int(config['test_play'].get('aggregate_runs', 1)))
 
@@ -107,36 +86,20 @@ class TrainPlayer:
         baseline_cfg = config['baseline']['train']
         device = torch.device(baseline_cfg['device'])
 
-        state = torch.load(baseline_cfg['state_file'], weights_only=True, map_location=torch.device('cpu'))
-        cfg = state['config']
-        version = cfg['control'].get('version', 1)
-        conv_channels = cfg['resnet']['conv_channels']
-        num_blocks = cfg['resnet']['num_blocks']
-        stable_mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks).eval()
-        stable_dqn = DQN(version=version).eval()
-        stable_mortal.load_state_dict(state['mortal'])
-        stable_dqn.load_state_dict(state['current_dqn'])
-        if baseline_cfg['enable_compile']:
-            stable_mortal.compile()
-            stable_dqn.compile()
-
-        self.baseline_engine = MortalEngine(
-            stable_mortal,
-            stable_dqn,
-            is_oracle = False,
-            version = version,
-            device = device,
-            enable_amp = True,
-            amp_dtype = _resolve_amp_dtype(cfg['control']),
-            enable_rule_based_agari_guard = True,
-            name = 'baseline',
+        state = torch.load(baseline_cfg['state_file'], weights_only=False, map_location=torch.device('cpu'))
+        self.baseline_engine, info = build_engine_from_state(
+            state,
+            device=device,
+            enable_compile=baseline_cfg['enable_compile'],
+            name='baseline',
         )
+        logging.info(f"loaded train baseline ({info['head_kind']}, norm={info['norm']})")
 
         profile = os.environ.get('TRAIN_PLAY_PROFILE', 'default')
         logging.info(f'using profile {profile}')
         cfg = config['train_play'][profile]
         self.chal_version = config['control']['version']
-        self.chal_amp_dtype = _resolve_amp_dtype(config['control'])
+        self.chal_amp_dtype = resolve_amp_dtype(config['control'])
         self.log_dir = path.abspath(cfg['log_dir'])
         self.train_key = secrets.randbits(64)
         self.train_seed = 10000
@@ -161,51 +124,13 @@ class TrainPlayer:
             return None
         chosen = path.join(pool_dir, random.choice(candidates))
         try:
-            state = torch.load(chosen, weights_only=True, map_location=torch.device('cpu'))
-            cfg = state['config']
-            version = cfg['control'].get('version', 1)
-            conv_channels = cfg['resnet']['conv_channels']
-            num_blocks = cfg['resnet']['num_blocks']
-
-            brain_state = state['mortal']
-            has_bn_stats = any('running_mean' in k for k in brain_state.keys())
-            norm = 'bn' if has_bn_stats else 'gn'
-
-            if 'policy_net' in state:
-                head_state = state['policy_net']
-            elif 'current_dqn' in state:
-                head_state = state['current_dqn']
-            else:
-                raise KeyError("checkpoint has neither 'policy_net' nor 'current_dqn'")
-
-            is_policy = ('fc1.weight' in head_state) and ('fc2.weight' in head_state)
-            if is_policy and version == 1:
-                raise ValueError('CategoricalPolicy does not support version 1 (latent dim mismatch)')
-
-            pool_mortal = Brain(
-                version=version,
-                conv_channels=conv_channels,
-                num_blocks=num_blocks,
-                norm=norm,
-            ).eval()
-            pool_head = CategoricalPolicy().eval() if is_policy else DQN(version=version).eval()
-
-            pool_mortal.load_state_dict(brain_state)
-            pool_head.load_state_dict(head_state)
-
-            head_kind = 'policy' if is_policy else 'dqn'
-            engine = MortalEngine(
-                pool_mortal,
-                pool_head,
-                is_oracle=False,
-                version=version,
-                device=device,
-                enable_amp=True,
-                amp_dtype=_resolve_amp_dtype(cfg['control']),
-                enable_rule_based_agari_guard=True,
-                name=f'pool-{head_kind}-{norm}',
+            state = torch.load(chosen, weights_only=False, map_location=torch.device('cpu'))
+            engine, info = build_engine_from_state(state, device=device, name='pool')
+            engine.name = f"pool-{info['head_kind']}-{info['norm']}"
+            logging.info(
+                f"using pool opponent ({info['head_kind']}, norm={info['norm']}): "
+                f"{path.basename(chosen)}"
             )
-            logging.info(f'using pool opponent ({head_kind}, norm={norm}): {path.basename(chosen)}')
             return engine
         except Exception as e:
             logging.warning(f'failed to load pool opponent {chosen}: {e}')

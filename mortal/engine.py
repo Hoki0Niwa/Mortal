@@ -4,6 +4,11 @@ import torch
 import numpy as np
 from torch.distributions import Normal, Categorical
 from typing import *
+from model import Brain, DQN, CategoricalPolicy
+
+def resolve_amp_dtype(cfg_control):
+    dtype_str = cfg_control.get('amp_dtype', 'float16')
+    return torch.bfloat16 if dtype_str == 'bfloat16' else torch.float16
 
 class MortalEngine:
     def __init__(
@@ -81,6 +86,57 @@ class MortalEngine:
             actions = q_out.argmax(-1)
 
         return actions.tolist(), q_out.tolist(), masks.tolist(), is_greedy.tolist()
+
+def build_engine_from_state(
+    state, *,
+    device,
+    enable_compile=False,
+    enable_amp=True,
+    enable_rule_based_agari_guard=True,
+    name='baseline',
+):
+    cfg = state['config']
+    version = cfg['control'].get('version', 1)
+    conv_channels = cfg['resnet']['conv_channels']
+    num_blocks = cfg['resnet']['num_blocks']
+
+    brain_state = state['mortal']
+    has_bn_stats = any('running_mean' in k for k in brain_state.keys())
+    norm = 'bn' if has_bn_stats else 'gn'
+
+    if 'policy_net' in state:
+        head_state = state['policy_net']
+    elif 'current_dqn' in state:
+        head_state = state['current_dqn']
+    else:
+        raise KeyError("checkpoint has neither 'policy_net' nor 'current_dqn'")
+
+    is_policy = ('fc1.weight' in head_state) and ('fc2.weight' in head_state)
+    if is_policy and version == 1:
+        raise ValueError('CategoricalPolicy does not support version 1 (latent dim mismatch)')
+
+    brain = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks, norm=norm).eval()
+    head = CategoricalPolicy().eval() if is_policy else DQN(version=version).eval()
+    brain.load_state_dict(brain_state)
+    head.load_state_dict(head_state)
+
+    if enable_compile:
+        brain.compile()
+        head.compile()
+
+    head_kind = 'policy' if is_policy else 'dqn'
+    engine = MortalEngine(
+        brain,
+        head,
+        is_oracle=False,
+        version=version,
+        device=device,
+        enable_amp=enable_amp,
+        amp_dtype=resolve_amp_dtype(cfg['control']),
+        enable_rule_based_agari_guard=enable_rule_based_agari_guard,
+        name=name,
+    )
+    return engine, {'head_kind': head_kind, 'norm': norm, 'version': version}
 
 def sample_top_p(logits, p):
     if p >= 1:
