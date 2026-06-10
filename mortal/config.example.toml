@@ -23,6 +23,28 @@ save_every = 400
 test_every = 20000
 submit_every = 400
 
+metrics_every = 1               # interval (in steps) of detailed train/* metrics; 1 = every step (old behavior)
+async_save = false              # save checkpoints in a background thread (tmp write + atomic replace)
+
+# Inference speedups for game play (trainee, opponent pool, baseline and
+# test_play engines alike). The whole section is optional and every key is
+# opt-in; the defaults below reproduce the old behavior.
+[inference]
+# pad batches up to fixed bucket sizes so cudnn benchmark kernels are reused
+bucket_batch = false
+buckets = [64, 128, 256, 512, 1024, 2048]
+# enable torch.backends.cudnn.benchmark while playing games
+cudnn_benchmark_in_play = false
+# cast model weights once for inference instead of re-casting under autocast on
+# every call; 'bf16'/'bfloat16' casts everything to bfloat16 (may change actions,
+# benchmark before use). Only applied to engines loaded from a state file, never
+# to live training models. Leave unset to keep autocast (old behavior).
+#weights_dtype = 'bfloat16'
+# capture the forward pass as a CUDA graph per bucket (requires bucket_batch);
+# buckets larger than graph_max_batch fall back to eager execution
+use_cuda_graphs = false
+graph_max_batch = 512
+
 # using env `TRAIN_PLAY_PROFILE`
 [train_play.default]
 games = 800
@@ -99,12 +121,17 @@ host = '127.0.0.1'
 port = 5000
 
 [online.server]
+# address the server listens on; defaults to online.remote.host when omitted.
+# Set '0.0.0.0' to accept workers from the LAN while local processes keep
+# connecting via online.remote.host
+bind_host = '127.0.0.1'
 buffer_dir = '/path/to/buffer'
 drain_dir = '/path/to/drain'
 sample_reuse_rate = 0
 sample_reuse_threshold = 0
 capacity = 1600
 force_sequential = false
+drain_min_count = 1             # do not drain until at least this many files are buffered
 
 [1v3]
 seed_key = -1
