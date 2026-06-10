@@ -9,7 +9,7 @@ import gc
 from os import path
 from model import Brain, DQN
 from player import TrainPlayer
-from common import send_msg, recv_msg
+from common import send_msg, recv_msg, UnexpectedEOF
 from config import config
 
 def main():
@@ -33,24 +33,32 @@ def main():
     history = []
 
     while True:
+        t_wait = time.monotonic()
         while True:
-            with socket.socket() as conn:
-                conn.connect(remote)
-                msg = {
-                    'type': 'get_param',
-                    'param_version': param_version,
-                }
-                send_msg(conn, msg)
-                rsp = recv_msg(conn, map_location=device)
+            # survive server/trainer restarts so workers can run unattended
+            try:
+                with socket.socket() as conn:
+                    conn.connect(remote)
+                    msg = {
+                        'type': 'get_param',
+                        'param_version': param_version,
+                    }
+                    send_msg(conn, msg)
+                    rsp = recv_msg(conn, map_location=device)
                 if rsp['status'] == 'ok':
                     param_version = rsp['param_version']
                     break
-                time.sleep(3)
+            except (OSError, UnexpectedEOF) as e:
+                logging.warning(f'server not reachable, retrying: {e}')
+            time.sleep(3)
+        param_wait_secs = time.monotonic() - t_wait
         mortal.load_state_dict(rsp['mortal'])
         dqn.load_state_dict(rsp['dqn'])
-        logging.info('param has been updated')
+        logging.info(f'param has been updated (waited {param_wait_secs:.1f}s)')
 
+        t_play = time.monotonic()
         rankings, file_list = train_player.train_play(mortal, dqn, device)
+        play_secs = time.monotonic() - t_play
         avg_rank = rankings @ np.arange(1, 5) / rankings.sum()
         avg_pt = rankings @ pts / rankings.sum()
 
@@ -69,14 +77,25 @@ def main():
             with open(filename, 'rb') as f:
                 logs[path.basename(filename)] = f.read()
 
-        with socket.socket() as conn:
-            conn.connect(remote)
-            send_msg(conn, {
-                'type': 'submit_replay',
-                'logs': logs,
-                'param_version': param_version,
-            })
-            logging.info('logs have been submitted')
+        t_submit = time.monotonic()
+        while True:
+            try:
+                with socket.socket() as conn:
+                    conn.connect(remote)
+                    send_msg(conn, {
+                        'type': 'submit_replay',
+                        'logs': logs,
+                        'param_version': param_version,
+                    })
+                logging.info('logs have been submitted')
+                break
+            except OSError as e:
+                logging.warning(f'submit failed, retrying in 15s: {e}')
+                time.sleep(15)
+        logging.info(
+            f'session timing: param_wait={param_wait_secs:.1f}s, '
+            f'play={play_secs:.1f}s, submit={time.monotonic() - t_submit:.1f}s'
+        )
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()

@@ -9,6 +9,8 @@ def train():
     import json
     import shutil
     import random
+    import time
+    import threading
     import torch
     from os import path
     from glob import glob
@@ -38,6 +40,8 @@ def train():
     test_games = config['test_play']['games']
     min_q_weight = config['cql']['min_q_weight']
     next_rank_weight = config['aux']['next_rank_weight']
+    metrics_every = config['control'].get('metrics_every', 1)
+    async_save = config['control'].get('async_save', False)
     assert save_every % opt_step_every == 0
     assert test_every % save_every == 0
 
@@ -102,6 +106,36 @@ def train():
         'avg_rank': 4.,
         'avg_pt': -135.,
     }
+
+    def state_to_cpu(obj):
+        if torch.is_tensor(obj):
+            return obj.detach().to('cpu', copy=True)
+        if isinstance(obj, dict):
+            return {k: state_to_cpu(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(state_to_cpu(v) for v in obj)
+        return obj
+
+    save_thread = None
+    def queue_save(state_cpu, filepath):
+        # single in-flight write; the snapshot is taken on the main thread so
+        # the background thread only does serialization and disk I/O
+        nonlocal save_thread
+        join_save()
+        def _save():
+            tmp = filepath + '.tmp'
+            torch.save(state_cpu, tmp)
+            os.replace(tmp, filepath)
+        save_thread = threading.Thread(target=_save, daemon=True)
+        save_thread.start()
+
+    def join_save():
+        nonlocal save_thread
+        if save_thread is not None:
+            save_thread.join()
+            save_thread = None
+
+    perf = {'block_t0': time.monotonic()}
 
     steps = 0
     state_file = config['control']['state_file']
@@ -254,6 +288,7 @@ def train():
     all_q = torch.zeros((save_every, batch_size), device=device, dtype=torch.float32)
     all_q_target = torch.zeros((save_every, batch_size), device=device, dtype=torch.float32)
     idx = 0
+    metrics_batches = 0
 
     def to_scalar(value):
         if torch.is_tensor(value):
@@ -303,7 +338,9 @@ def train():
         player_names = []
         if online:
             player_names = ['trainee']
+            t_drain = time.monotonic()
             dirname = drain()
+            logging.info(f'drain wait: {time.monotonic() - t_drain:.1f}s')
             file_list = list(map(lambda p: path.join(dirname, p), os.listdir(dirname)))
         else:
             player_names_set = set()
@@ -374,16 +411,21 @@ def train():
             nonlocal steps
             nonlocal idx
             nonlocal pb
+            nonlocal metrics_batches
 
-            obs = obs.to(dtype=torch.float32, device=device)
-            actions = actions.to(dtype=torch.int64, device=device)
-            masks = masks.to(dtype=torch.bool, device=device)
-            steps_to_done = steps_to_done.to(dtype=torch.int64, device=device)
-            kyoku_rewards = kyoku_rewards.to(dtype=torch.float64, device=device)
-            player_ranks = player_ranks.to(dtype=torch.int64, device=device)
-            at_turns = at_turns.to(dtype=torch.float32, device=device)
-            shantens = shantens.to(dtype=torch.int64, device=device)
-            assert masks[range(batch_size), actions].all()
+            # non_blocking pairs with the DataLoader's pin_memory to overlap
+            # H2D transfers with compute; results are identical
+            obs = obs.to(dtype=torch.float32, device=device, non_blocking=True)
+            actions = actions.to(dtype=torch.int64, device=device, non_blocking=True)
+            masks = masks.to(dtype=torch.bool, device=device, non_blocking=True)
+            steps_to_done = steps_to_done.to(dtype=torch.int64, device=device, non_blocking=True)
+            kyoku_rewards = kyoku_rewards.to(dtype=torch.float64, device=device, non_blocking=True)
+            player_ranks = player_ranks.to(dtype=torch.int64, device=device, non_blocking=True)
+            at_turns = at_turns.to(dtype=torch.float32, device=device, non_blocking=True)
+            shantens = shantens.to(dtype=torch.int64, device=device, non_blocking=True)
+            detailed_metrics = metrics_every <= 1 or steps % metrics_every == 0
+            if detailed_metrics:
+                assert masks[range(batch_size), actions].all()
 
             q_target_mc = gamma ** steps_to_done * kyoku_rewards
             q_target_mc = q_target_mc.to(torch.float32)
@@ -415,215 +457,223 @@ def train():
                 all_q[idx] = q
                 all_q_target[idx] = q_target_mc
 
-                q_metric = q.float()
-                q_out_metric = q_out.float()
-                reward = kyoku_rewards.to(torch.float32)
-                legal_action_count = masks.sum(-1).to(torch.float32)
-                q_best, q_best_action = q_out_metric.max(-1)
-                legal_q = q_out_metric.masked_select(masks)
-                q_top2 = q_out_metric.topk(k=2, dim=-1).values
-                q_margin = q_top2[:, 0] - q_top2[:, 1]
-                q_margin = q_margin[torch.isfinite(q_margin)]
+                if detailed_metrics:
+                    metrics_batches += 1
+                    q_metric = q.float()
+                    q_out_metric = q_out.float()
+                    reward = kyoku_rewards.to(torch.float32)
+                    legal_action_count = masks.sum(-1).to(torch.float32)
+                    q_best, q_best_action = q_out_metric.max(-1)
+                    legal_q = q_out_metric.masked_select(masks)
+                    q_top2 = q_out_metric.topk(k=2, dim=-1).values
+                    q_margin = q_top2[:, 0] - q_top2[:, 1]
+                    q_margin = q_margin[torch.isfinite(q_margin)]
 
-                probs = q_out_metric.softmax(-1)
-                entropy = -(probs * probs.clamp_min(1e-8).log()).sum(-1)
-                max_entropy = legal_action_count.log()
-                entropy_norm = torch.where(
-                    legal_action_count > 1,
-                    entropy / max_entropy.clamp_min(1e-8),
-                    torch.zeros_like(entropy),
-                )
-
-                metrics['train/reward_mean'] += reward.mean()
-                metrics['train/reward_std'] += reward.std(unbiased=False)
-                metrics['train/reward_positive_rate'] += (reward > 0).to(torch.float32).mean()
-                metrics['train/reward_negative_rate'] += (reward < 0).to(torch.float32).mean()
-                metrics['train/steps_to_done_mean'] += steps_to_done.to(torch.float32).mean()
-                metrics['train/turn_mean'] += at_turns.mean()
-                metrics['train/shanten/tenpai_or_better_rate'] += (shantens <= 0).to(torch.float32).mean()
-                metrics['train/shanten/one_shanten_rate'] += (shantens == 1).to(torch.float32).mean()
-                metrics['train/shanten/two_shanten_rate'] += (shantens == 2).to(torch.float32).mean()
-                metrics['train/shanten/three_plus_shanten_rate'] += (shantens >= 3).to(torch.float32).mean()
-                metrics['train/legal_action_count_mean'] += legal_action_count.mean()
-                metrics['train/legal_action_count_max'] += legal_action_count.max()
-                metrics['train/q_best_mean'] += q_best.mean()
-                metrics['train/q_legal_mean'] += legal_q.mean()
-                metrics['train/q_legal_std'] += legal_q.std(unbiased=False)
-                metrics['train/q_legal_min'] += legal_q.min()
-                metrics['train/q_legal_max'] += legal_q.max()
-                metrics['train/q_logged_gap_to_best'] += (q_best - q_metric).mean()
-                if q_margin.numel() > 0:
-                    metrics['train/q_top1_top2_margin'] += q_margin.mean()
-                metrics['train/logged_action_argmax_rate'] += (q_best_action == actions).to(torch.float32).mean()
-                metrics['train/policy_entropy'] += entropy.mean()
-                metrics['train/policy_entropy_norm'] += entropy_norm.mean()
-
-                metrics['train/action_rate/discard'] += (actions <= 36).to(torch.float32).mean()
-                metrics['train/action_rate/riichi'] += (actions == 37).to(torch.float32).mean()
-                metrics['train/action_rate/chi'] += ((actions >= 38) & (actions <= 40)).to(torch.float32).mean()
-                metrics['train/action_rate/pon'] += (actions == 41).to(torch.float32).mean()
-                metrics['train/action_rate/kan'] += (actions == 42).to(torch.float32).mean()
-                metrics['train/action_rate/agari'] += (actions == 43).to(torch.float32).mean()
-                metrics['train/action_rate/ryukyoku'] += (actions == 44).to(torch.float32).mean()
-                metrics['train/action_rate/none'] += (actions == 45).to(torch.float32).mean()
-
-                agari_opp = masks[:, 43]
-                metrics['train/agari/agari_opportunity_rate'] += agari_opp.to(torch.float32).mean()
-                if agari_opp.any():
-                    non_agari_q = q_out_metric.masked_fill(~masks, -torch.inf)
-                    non_agari_q[:, 43] = -torch.inf
-                    best_non_agari_q = non_agari_q.max(-1).values
-                    metrics['train/agari/agari_taken_given_opportunity'] += (actions[agari_opp] == 43).to(torch.float32).mean()
-                    metrics['train/agari/agari_argmax_given_opportunity'] += (q_best_action[agari_opp] == 43).to(torch.float32).mean()
-                    metrics['train/agari/q_agari_minus_best_non_agari'] += (
-                        q_out_metric[agari_opp, 43] - best_non_agari_q[agari_opp]
-                    ).mean()
-
-                threats = extract_threats(obs)
-                is_call_action = (actions >= 38) & (actions <= 42)
-                is_none_action = actions == 45
-                is_riichi_action = actions == 37
-                is_agari_action = actions == 43
-                tenpai_or_better = shantens <= 0
-                one_shanten = shantens == 1
-                if threats is not None:
-                    opp_riichi = threats['riichi']
-                    opp_fuuro = threats['fuuro']
-                    opp_fuuro_no_riichi = threats['fuuro_no_riichi']
-                    any_threat = threats['any']
-                    no_threat = ~any_threat
-                    metrics['train/threat/opp_riichi_rate'] += opp_riichi.to(torch.float32).mean()
-                    metrics['train/threat/opp_fuuro_rate'] += opp_fuuro.to(torch.float32).mean()
-                    metrics['train/threat/opp_fuuro_no_riichi_rate'] += opp_fuuro_no_riichi.to(torch.float32).mean()
-                    metrics['train/threat/opp_riichi_and_fuuro_rate'] += threats['riichi_and_fuuro'].to(torch.float32).mean()
-                    metrics['train/threat/any_threat_rate'] += any_threat.to(torch.float32).mean()
-
-                    threat_groups = (
-                        ('no_threat', no_threat),
-                        ('riichi', opp_riichi),
-                        ('fuuro_no_riichi', opp_fuuro_no_riichi),
+                    probs = q_out_metric.softmax(-1)
+                    entropy = -(probs * probs.clamp_min(1e-8).log()).sum(-1)
+                    max_entropy = legal_action_count.log()
+                    entropy_norm = torch.where(
+                        legal_action_count > 1,
+                        entropy / max_entropy.clamp_min(1e-8),
+                        torch.zeros_like(entropy),
                     )
-                    for label, cond in threat_groups:
-                        if not cond.any():
-                            continue
-                        metrics[f'train/threat/none_rate_vs_{label}'] += is_none_action[cond].to(torch.float32).mean()
-                        metrics[f'train/threat/call_rate_vs_{label}'] += is_call_action[cond].to(torch.float32).mean()
-                        metrics[f'train/threat/riichi_rate_vs_{label}'] += is_riichi_action[cond].to(torch.float32).mean()
-                        metrics[f'train/threat/agari_rate_vs_{label}'] += is_agari_action[cond].to(torch.float32).mean()
 
-                    for label, cond in (('riichi', opp_riichi), ('fuuro_no_riichi', opp_fuuro_no_riichi)):
-                        one = cond & one_shanten
-                        if one.any():
-                            metrics[f'train/threat/one_shanten_none_rate_vs_{label}'] += is_none_action[one].to(torch.float32).mean()
-                            metrics[f'train/threat/one_shanten_call_rate_vs_{label}'] += is_call_action[one].to(torch.float32).mean()
-                        tenpai = cond & tenpai_or_better
-                        if tenpai.any():
-                            metrics[f'train/threat/tenpai_none_rate_vs_{label}'] += is_none_action[tenpai].to(torch.float32).mean()
-                            metrics[f'train/threat/tenpai_riichi_rate_vs_{label}'] += is_riichi_action[tenpai].to(torch.float32).mean()
+                    metrics['train/reward_mean'] += reward.mean()
+                    metrics['train/reward_std'] += reward.std(unbiased=False)
+                    metrics['train/reward_positive_rate'] += (reward > 0).to(torch.float32).mean()
+                    metrics['train/reward_negative_rate'] += (reward < 0).to(torch.float32).mean()
+                    metrics['train/steps_to_done_mean'] += steps_to_done.to(torch.float32).mean()
+                    metrics['train/turn_mean'] += at_turns.mean()
+                    metrics['train/shanten/tenpai_or_better_rate'] += (shantens <= 0).to(torch.float32).mean()
+                    metrics['train/shanten/one_shanten_rate'] += (shantens == 1).to(torch.float32).mean()
+                    metrics['train/shanten/two_shanten_rate'] += (shantens == 2).to(torch.float32).mean()
+                    metrics['train/shanten/three_plus_shanten_rate'] += (shantens >= 3).to(torch.float32).mean()
+                    metrics['train/legal_action_count_mean'] += legal_action_count.mean()
+                    metrics['train/legal_action_count_max'] += legal_action_count.max()
+                    metrics['train/q_best_mean'] += q_best.mean()
+                    metrics['train/q_legal_mean'] += legal_q.mean()
+                    metrics['train/q_legal_std'] += legal_q.std(unbiased=False)
+                    metrics['train/q_legal_min'] += legal_q.min()
+                    metrics['train/q_legal_max'] += legal_q.max()
+                    metrics['train/q_logged_gap_to_best'] += (q_best - q_metric).mean()
+                    if q_margin.numel() > 0:
+                        metrics['train/q_top1_top2_margin'] += q_margin.mean()
+                    metrics['train/logged_action_argmax_rate'] += (q_best_action == actions).to(torch.float32).mean()
+                    metrics['train/policy_entropy'] += entropy.mean()
+                    metrics['train/policy_entropy_norm'] += entropy_norm.mean()
 
-                call_legal = masks[:, 38:43].any(-1)
-                call_opp = call_legal & masks[:, 45]
-                metrics['train/call/call_opportunity_rate'] += call_opp.to(torch.float32).mean()
-                if call_opp.any():
-                    call_actions = (actions >= 38) & (actions <= 42)
-                    call_argmax = (q_best_action >= 38) & (q_best_action <= 42)
-                    none_argmax = q_best_action == 45
-                    q_none = q_out_metric[:, 45]
-                    q_chi = q_out_metric[:, 38:41].masked_fill(~masks[:, 38:41], -torch.inf).max(-1).values
-                    q_pon = q_out_metric[:, 41].masked_fill(~masks[:, 41], -torch.inf)
-                    q_kan = q_out_metric[:, 42].masked_fill(~masks[:, 42], -torch.inf)
-                    q_best_call = torch.stack((q_chi, q_pon, q_kan), dim=-1).max(-1).values
-                    chi_opp = call_opp & torch.isfinite(q_chi)
-                    pon_opp = call_opp & torch.isfinite(q_pon)
-                    kan_opp = call_opp & torch.isfinite(q_kan)
-                    metrics['train/call/chi_opportunity_rate'] += chi_opp.to(torch.float32).mean()
-                    metrics['train/call/pon_opportunity_rate'] += pon_opp.to(torch.float32).mean()
-                    metrics['train/call/kan_opportunity_rate'] += kan_opp.to(torch.float32).mean()
-                    metrics['train/call/call_taken_given_opportunity'] += call_actions[call_opp].to(torch.float32).mean()
-                    metrics['train/call/call_argmax_given_opportunity'] += call_argmax[call_opp].to(torch.float32).mean()
-                    metrics['train/call/none_argmax_given_opportunity'] += none_argmax[call_opp].to(torch.float32).mean()
-                    metrics['train/call/q_best_call_minus_none'] += (q_best_call[call_opp] - q_none[call_opp]).mean()
-                    if chi_opp.any():
-                        metrics['train/call/q_chi_best_minus_none'] += (q_chi[chi_opp] - q_none[chi_opp]).mean()
-                    if pon_opp.any():
-                        metrics['train/call/q_pon_minus_none'] += (q_pon[pon_opp] - q_none[pon_opp]).mean()
-                    if kan_opp.any():
-                        metrics['train/call/q_kan_minus_none'] += (q_kan[kan_opp] - q_none[kan_opp]).mean()
+                    metrics['train/action_rate/discard'] += (actions <= 36).to(torch.float32).mean()
+                    metrics['train/action_rate/riichi'] += (actions == 37).to(torch.float32).mean()
+                    metrics['train/action_rate/chi'] += ((actions >= 38) & (actions <= 40)).to(torch.float32).mean()
+                    metrics['train/action_rate/pon'] += (actions == 41).to(torch.float32).mean()
+                    metrics['train/action_rate/kan'] += (actions == 42).to(torch.float32).mean()
+                    metrics['train/action_rate/agari'] += (actions == 43).to(torch.float32).mean()
+                    metrics['train/action_rate/ryukyoku'] += (actions == 44).to(torch.float32).mean()
+                    metrics['train/action_rate/none'] += (actions == 45).to(torch.float32).mean()
 
-                    if threats is not None:
-                        for label, cond in (('riichi', opp_riichi), ('fuuro_no_riichi', opp_fuuro_no_riichi)):
-                            threat_call_opp = call_opp & cond
-                            if not threat_call_opp.any():
-                                continue
-                            metrics[f'train/threat/call_taken_given_{label}'] += call_actions[threat_call_opp].to(torch.float32).mean()
-                            metrics[f'train/threat/none_argmax_given_call_opp_vs_{label}'] += none_argmax[threat_call_opp].to(torch.float32).mean()
-                            metrics[f'train/threat/q_best_call_minus_none_vs_{label}'] += (
-                                q_best_call[threat_call_opp] - q_none[threat_call_opp]
-                            ).mean()
-
-                riichi_opp = masks[:, 37]
-                if threats is not None and riichi_opp.any():
-                    non_riichi_q = q_out_metric.masked_fill(~masks, -torch.inf)
-                    non_riichi_q[:, 37] = -torch.inf
-                    best_non_riichi_q = non_riichi_q.max(-1).values
-                    for label, cond in (('riichi', opp_riichi), ('fuuro_no_riichi', opp_fuuro_no_riichi)):
-                        threat_riichi_opp = riichi_opp & cond
-                        if not threat_riichi_opp.any():
-                            continue
-                        metrics[f'train/threat/riichi_taken_given_{label}'] += (actions[threat_riichi_opp] == 37).to(torch.float32).mean()
-                        metrics[f'train/threat/q_riichi_minus_best_non_riichi_vs_{label}'] += (
-                            q_out_metric[threat_riichi_opp, 37] - best_non_riichi_q[threat_riichi_opp]
+                    agari_opp = masks[:, 43]
+                    metrics['train/agari/agari_opportunity_rate'] += agari_opp.to(torch.float32).mean()
+                    if agari_opp.any():
+                        non_agari_q = q_out_metric.masked_fill(~masks, -torch.inf)
+                        non_agari_q[:, 43] = -torch.inf
+                        best_non_agari_q = non_agari_q.max(-1).values
+                        metrics['train/agari/agari_taken_given_opportunity'] += (actions[agari_opp] == 43).to(torch.float32).mean()
+                        metrics['train/agari/agari_argmax_given_opportunity'] += (q_best_action[agari_opp] == 43).to(torch.float32).mean()
+                        metrics['train/agari/q_agari_minus_best_non_agari'] += (
+                            q_out_metric[agari_opp, 43] - best_non_agari_q[agari_opp]
                         ).mean()
 
-                is_call_action = (actions >= 38) & (actions <= 42)
-                is_none_action = actions == 45
-                is_riichi_action = actions == 37
-                tenpai_or_better = shantens <= 0
-                one_shanten = shantens == 1
-                two_plus_shanten = shantens >= 2
-                if tenpai_or_better.any():
-                    metrics['train/by_shanten/tenpai_or_better/call_rate'] += is_call_action[tenpai_or_better].to(torch.float32).mean()
-                    metrics['train/by_shanten/tenpai_or_better/riichi_rate'] += is_riichi_action[tenpai_or_better].to(torch.float32).mean()
-                    metrics['train/by_shanten/tenpai_or_better/none_rate'] += is_none_action[tenpai_or_better].to(torch.float32).mean()
-                if one_shanten.any():
-                    metrics['train/by_shanten/one_shanten/call_rate'] += is_call_action[one_shanten].to(torch.float32).mean()
-                    metrics['train/by_shanten/one_shanten/none_rate'] += is_none_action[one_shanten].to(torch.float32).mean()
-                if two_plus_shanten.any():
-                    metrics['train/by_shanten/two_plus_shanten/call_rate'] += is_call_action[two_plus_shanten].to(torch.float32).mean()
-                    metrics['train/by_shanten/two_plus_shanten/none_rate'] += is_none_action[two_plus_shanten].to(torch.float32).mean()
-                for rank, tag in enumerate(rank_metric_tags):
-                    metrics[tag] += (player_ranks == rank).to(torch.float32).mean()
+                    threats = extract_threats(obs)
+                    is_call_action = (actions >= 38) & (actions <= 42)
+                    is_none_action = actions == 45
+                    is_riichi_action = actions == 37
+                    is_agari_action = actions == 43
+                    tenpai_or_better = shantens <= 0
+                    one_shanten = shantens == 1
+                    if threats is not None:
+                        opp_riichi = threats['riichi']
+                        opp_fuuro = threats['fuuro']
+                        opp_fuuro_no_riichi = threats['fuuro_no_riichi']
+                        any_threat = threats['any']
+                        no_threat = ~any_threat
+                        metrics['train/threat/opp_riichi_rate'] += opp_riichi.to(torch.float32).mean()
+                        metrics['train/threat/opp_fuuro_rate'] += opp_fuuro.to(torch.float32).mean()
+                        metrics['train/threat/opp_fuuro_no_riichi_rate'] += opp_fuuro_no_riichi.to(torch.float32).mean()
+                        metrics['train/threat/opp_riichi_and_fuuro_rate'] += threats['riichi_and_fuuro'].to(torch.float32).mean()
+                        metrics['train/threat/any_threat_rate'] += any_threat.to(torch.float32).mean()
+
+                        threat_groups = (
+                            ('no_threat', no_threat),
+                            ('riichi', opp_riichi),
+                            ('fuuro_no_riichi', opp_fuuro_no_riichi),
+                        )
+                        for label, cond in threat_groups:
+                            if not cond.any():
+                                continue
+                            metrics[f'train/threat/none_rate_vs_{label}'] += is_none_action[cond].to(torch.float32).mean()
+                            metrics[f'train/threat/call_rate_vs_{label}'] += is_call_action[cond].to(torch.float32).mean()
+                            metrics[f'train/threat/riichi_rate_vs_{label}'] += is_riichi_action[cond].to(torch.float32).mean()
+                            metrics[f'train/threat/agari_rate_vs_{label}'] += is_agari_action[cond].to(torch.float32).mean()
+
+                        for label, cond in (('riichi', opp_riichi), ('fuuro_no_riichi', opp_fuuro_no_riichi)):
+                            one = cond & one_shanten
+                            if one.any():
+                                metrics[f'train/threat/one_shanten_none_rate_vs_{label}'] += is_none_action[one].to(torch.float32).mean()
+                                metrics[f'train/threat/one_shanten_call_rate_vs_{label}'] += is_call_action[one].to(torch.float32).mean()
+                            tenpai = cond & tenpai_or_better
+                            if tenpai.any():
+                                metrics[f'train/threat/tenpai_none_rate_vs_{label}'] += is_none_action[tenpai].to(torch.float32).mean()
+                                metrics[f'train/threat/tenpai_riichi_rate_vs_{label}'] += is_riichi_action[tenpai].to(torch.float32).mean()
+
+                    call_legal = masks[:, 38:43].any(-1)
+                    call_opp = call_legal & masks[:, 45]
+                    metrics['train/call/call_opportunity_rate'] += call_opp.to(torch.float32).mean()
+                    if call_opp.any():
+                        call_actions = (actions >= 38) & (actions <= 42)
+                        call_argmax = (q_best_action >= 38) & (q_best_action <= 42)
+                        none_argmax = q_best_action == 45
+                        q_none = q_out_metric[:, 45]
+                        q_chi = q_out_metric[:, 38:41].masked_fill(~masks[:, 38:41], -torch.inf).max(-1).values
+                        q_pon = q_out_metric[:, 41].masked_fill(~masks[:, 41], -torch.inf)
+                        q_kan = q_out_metric[:, 42].masked_fill(~masks[:, 42], -torch.inf)
+                        q_best_call = torch.stack((q_chi, q_pon, q_kan), dim=-1).max(-1).values
+                        chi_opp = call_opp & torch.isfinite(q_chi)
+                        pon_opp = call_opp & torch.isfinite(q_pon)
+                        kan_opp = call_opp & torch.isfinite(q_kan)
+                        metrics['train/call/chi_opportunity_rate'] += chi_opp.to(torch.float32).mean()
+                        metrics['train/call/pon_opportunity_rate'] += pon_opp.to(torch.float32).mean()
+                        metrics['train/call/kan_opportunity_rate'] += kan_opp.to(torch.float32).mean()
+                        metrics['train/call/call_taken_given_opportunity'] += call_actions[call_opp].to(torch.float32).mean()
+                        metrics['train/call/call_argmax_given_opportunity'] += call_argmax[call_opp].to(torch.float32).mean()
+                        metrics['train/call/none_argmax_given_opportunity'] += none_argmax[call_opp].to(torch.float32).mean()
+                        metrics['train/call/q_best_call_minus_none'] += (q_best_call[call_opp] - q_none[call_opp]).mean()
+                        if chi_opp.any():
+                            metrics['train/call/q_chi_best_minus_none'] += (q_chi[chi_opp] - q_none[chi_opp]).mean()
+                        if pon_opp.any():
+                            metrics['train/call/q_pon_minus_none'] += (q_pon[pon_opp] - q_none[pon_opp]).mean()
+                        if kan_opp.any():
+                            metrics['train/call/q_kan_minus_none'] += (q_kan[kan_opp] - q_none[kan_opp]).mean()
+
+                        if threats is not None:
+                            for label, cond in (('riichi', opp_riichi), ('fuuro_no_riichi', opp_fuuro_no_riichi)):
+                                threat_call_opp = call_opp & cond
+                                if not threat_call_opp.any():
+                                    continue
+                                metrics[f'train/threat/call_taken_given_{label}'] += call_actions[threat_call_opp].to(torch.float32).mean()
+                                metrics[f'train/threat/none_argmax_given_call_opp_vs_{label}'] += none_argmax[threat_call_opp].to(torch.float32).mean()
+                                metrics[f'train/threat/q_best_call_minus_none_vs_{label}'] += (
+                                    q_best_call[threat_call_opp] - q_none[threat_call_opp]
+                                ).mean()
+
+                    riichi_opp = masks[:, 37]
+                    if threats is not None and riichi_opp.any():
+                        non_riichi_q = q_out_metric.masked_fill(~masks, -torch.inf)
+                        non_riichi_q[:, 37] = -torch.inf
+                        best_non_riichi_q = non_riichi_q.max(-1).values
+                        for label, cond in (('riichi', opp_riichi), ('fuuro_no_riichi', opp_fuuro_no_riichi)):
+                            threat_riichi_opp = riichi_opp & cond
+                            if not threat_riichi_opp.any():
+                                continue
+                            metrics[f'train/threat/riichi_taken_given_{label}'] += (actions[threat_riichi_opp] == 37).to(torch.float32).mean()
+                            metrics[f'train/threat/q_riichi_minus_best_non_riichi_vs_{label}'] += (
+                                q_out_metric[threat_riichi_opp, 37] - best_non_riichi_q[threat_riichi_opp]
+                            ).mean()
+
+                    is_call_action = (actions >= 38) & (actions <= 42)
+                    is_none_action = actions == 45
+                    is_riichi_action = actions == 37
+                    tenpai_or_better = shantens <= 0
+                    one_shanten = shantens == 1
+                    two_plus_shanten = shantens >= 2
+                    if tenpai_or_better.any():
+                        metrics['train/by_shanten/tenpai_or_better/call_rate'] += is_call_action[tenpai_or_better].to(torch.float32).mean()
+                        metrics['train/by_shanten/tenpai_or_better/riichi_rate'] += is_riichi_action[tenpai_or_better].to(torch.float32).mean()
+                        metrics['train/by_shanten/tenpai_or_better/none_rate'] += is_none_action[tenpai_or_better].to(torch.float32).mean()
+                    if one_shanten.any():
+                        metrics['train/by_shanten/one_shanten/call_rate'] += is_call_action[one_shanten].to(torch.float32).mean()
+                        metrics['train/by_shanten/one_shanten/none_rate'] += is_none_action[one_shanten].to(torch.float32).mean()
+                    if two_plus_shanten.any():
+                        metrics['train/by_shanten/two_plus_shanten/call_rate'] += is_call_action[two_plus_shanten].to(torch.float32).mean()
+                        metrics['train/by_shanten/two_plus_shanten/none_rate'] += is_none_action[two_plus_shanten].to(torch.float32).mean()
+                    for rank, tag in enumerate(rank_metric_tags):
+                        metrics[tag] += (player_ranks == rank).to(torch.float32).mean()
 
             steps += 1
             idx += 1
             if idx % opt_step_every == 0:
                 if scaler.is_enabled():
                     scaler.unscale_(optimizer)
-                grad_norm_mortal = module_grad_norm(mortal)
-                grad_norm_dqn = module_grad_norm(dqn)
-                grad_norm_aux = module_grad_norm(aux_net)
-                grad_norm_total = (
-                    grad_norm_mortal.square()
-                    + grad_norm_dqn.square()
-                    + grad_norm_aux.square()
-                ).sqrt()
-                opt_metrics['count'] += 1
-                opt_metrics['grad/total_norm'] += grad_norm_total
-                opt_metrics['grad/mortal_norm'] += grad_norm_mortal
-                opt_metrics['grad/dqn_norm'] += grad_norm_dqn
-                opt_metrics['grad/aux_norm'] += grad_norm_aux
+                if detailed_metrics:
+                    grad_norm_mortal = module_grad_norm(mortal)
+                    grad_norm_dqn = module_grad_norm(dqn)
+                    grad_norm_aux = module_grad_norm(aux_net)
+                    grad_norm_total = (
+                        grad_norm_mortal.square()
+                        + grad_norm_dqn.square()
+                        + grad_norm_aux.square()
+                    ).sqrt()
+                    opt_metrics['count'] += 1
+                    opt_metrics['grad/total_norm'] += grad_norm_total
+                    opt_metrics['grad/mortal_norm'] += grad_norm_mortal
+                    opt_metrics['grad/dqn_norm'] += grad_norm_dqn
+                    opt_metrics['grad/aux_norm'] += grad_norm_aux
 
-                if max_grad_norm > 0:
+                    if max_grad_norm > 0:
+                        params = chain.from_iterable(g['params'] for g in optimizer.param_groups)
+                        clip_grad_norm_(params, max_grad_norm)
+                        post_clip_total = (
+                            module_grad_norm(mortal).square()
+                            + module_grad_norm(dqn).square()
+                            + module_grad_norm(aux_net).square()
+                        ).sqrt()
+                    else:
+                        post_clip_total = grad_norm_total
+                    opt_metrics['grad/post_clip_total_norm'] += post_clip_total
+                elif max_grad_norm > 0:
+                    # clipping is part of training and must run every opt step;
+                    # only the extra norm bookkeeping is skipped here
                     params = chain.from_iterable(g['params'] for g in optimizer.param_groups)
                     clip_grad_norm_(params, max_grad_norm)
-                    post_clip_total = (
-                        module_grad_norm(mortal).square()
-                        + module_grad_norm(dqn).square()
-                        + module_grad_norm(aux_net).square()
-                    ).sqrt()
-                else:
-                    post_clip_total = grad_norm_total
-                opt_metrics['grad/post_clip_total_norm'] += post_clip_total
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
@@ -636,6 +686,16 @@ def train():
 
             if steps % save_every == 0:
                 pb.close()
+
+                block_secs = time.monotonic() - perf['block_t0']
+                writer.add_scalar('perf/steps_per_sec', save_every / max(1e-9, block_secs), steps)
+                if device.type == 'cuda':
+                    writer.add_scalar(
+                        'perf/gpu_mem_peak_gb',
+                        torch.cuda.max_memory_allocated(device) / 2**30,
+                        steps,
+                    )
+                    torch.cuda.reset_peak_memory_stats(device)
 
                 # downsample to reduce tensorboard event size
                 all_q_1d = all_q.cpu().numpy().flatten()[::128]
@@ -664,7 +724,7 @@ def train():
                 for tag, value in metrics.items():
                     if version != 4 and tag.startswith('train/threat/'):
                         continue
-                    writer.add_scalar(tag, to_scalar(value / save_every), steps)
+                    writer.add_scalar(tag, to_scalar(value / max(1, metrics_batches)), steps)
 
                 opt_count = opt_metrics['count']
                 if opt_count > 0:
@@ -706,6 +766,7 @@ def train():
                 for k in opt_metrics:
                     opt_metrics[k] = 0
                 idx = 0
+                metrics_batches = 0
 
                 before_next_test_play = (test_every - steps % test_every) % test_every
                 logging.info(f'total steps: {steps:,} (~{before_next_test_play:,})')
@@ -723,14 +784,24 @@ def train():
                     'top_checkpoints': top_checkpoints,
                     'config': config,
                 }
-                torch.save(state, state_file)
+                t_save = time.monotonic()
+                if async_save:
+                    queue_save(state_to_cpu(state), state_file)
+                else:
+                    torch.save(state, state_file)
+                writer.add_scalar('perf/checkpoint_save_sec', time.monotonic() - t_save, steps)
 
                 if online and steps % submit_every != 0:
                     submit_param(mortal, dqn, is_idle=False)
                     logging.info('param has been submitted')
 
                 if steps % test_every == 0:
+                    # make sure the checkpoint just queued is fully on disk
+                    # before it gets copied below
+                    join_save()
+                    t_test = time.monotonic()
                     stat = test_player.test_play(test_games // 4, mortal, dqn, device)
+                    writer.add_scalar('perf/test_play_sec', time.monotonic() - t_test, steps)
                     mortal.train()
                     dqn.train()
 
@@ -786,7 +857,10 @@ def train():
                     writer.flush()
 
                     if better:
-                        torch.save(state, state_file)
+                        if not async_save:
+                            # with async_save the same state is already fully
+                            # written to state_file (joined above)
+                            torch.save(state, state_file)
                         logging.info(
                             'a new record has been made, '
                             f'pt: {past_best["avg_pt"]:.4} -> {best_perf["avg_pt"]:.4}, '
@@ -823,6 +897,7 @@ def train():
                         # is the reason why `main` spawns a sub process to train
                         # in online mode instead of going for training directly.
                         sys.exit(0)
+                perf['block_t0'] = time.monotonic()
                 pb = tqdm(total=save_every, desc='TRAIN')
 
         for obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks, at_turns, shantens in data_loader:
@@ -879,6 +954,7 @@ def train():
         if not online:
             # only run one epoch for offline for easier control
             break
+    join_save()
 
 def main():
     import os

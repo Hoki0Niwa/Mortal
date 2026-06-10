@@ -21,6 +21,7 @@ class State:
     drain_dir: str
     capacity: int
     force_sequential: bool
+    drain_min_count: int
     dir_lock: Lock
     param_lock: Lock
     # fields below are protected by dir_lock
@@ -99,7 +100,8 @@ class Handler(BaseRequestHandler):
             buffer_list = os.listdir(S.buffer_dir)
             raw_count = len(buffer_list)
             assert raw_count == S.buffer_size
-            if (not S.force_sequential or raw_count >= S.capacity) and raw_count > 0:
+            min_count = max(1, S.drain_min_count)
+            if (not S.force_sequential or raw_count >= S.capacity) and raw_count >= min_count:
                 old_drain_list = os.listdir(S.drain_dir)
                 for filename in old_drain_list:
                     filepath = path.join(S.drain_dir, filename)
@@ -138,6 +140,7 @@ def main():
         drain_dir = path.abspath(cfg['drain_dir']),
         capacity = cfg['capacity'],
         force_sequential = cfg['force_sequential'],
+        drain_min_count = cfg.get('drain_min_count', 1),
         dir_lock = Lock(),
         param_lock = Lock(),
         buffer_size = 0,
@@ -148,7 +151,10 @@ def main():
         idle_param_version = 0,
     )
 
-    bind_addr = (config['online']['remote']['host'], config['online']['remote']['port'])
+    # bind_host lets the server listen on the LAN (e.g. '0.0.0.0') while local
+    # processes keep connecting via remote.host (127.0.0.1)
+    bind_host = cfg.get('bind_host', config['online']['remote']['host'])
+    bind_addr = (bind_host, config['online']['remote']['port'])
     if path.isdir(S.buffer_dir):
         shutil.rmtree(S.buffer_dir)
     if path.isdir(S.drain_dir):
