@@ -1,5 +1,5 @@
 use super::candidate::RawCandidate;
-use super::state::{InitState, State};
+use super::state::{InitState, ShantenDeltaCache, State};
 use super::tile::{DiscardTile, DrawTile};
 use super::{Candidate, CandidateColumn, MAX_TSUMOS_LEFT};
 use crate::algo::agari::{Agari, AgariCalculator};
@@ -70,6 +70,17 @@ struct SPCalculatorState<'a, const MAX_TSUMO: usize> {
     discard_cache: StateCache<MAX_TSUMO>,
     draw_cache: StateCache<MAX_TSUMO>,
 
+    /// Lazily memoized `prob` triangles of `draw_without_tegawari_slow`,
+    /// indexed by `sum_required_tiles * 4 + (count - 1)`. The values only
+    /// depend on `(sum_required_tiles, count)`, so they can be shared across
+    /// all draws within one `calc` run.
+    prob_cache: Vec<Option<Box<[[f32; MAX_TSUMO]; MAX_TSUMO]>>>,
+
+    /// Shanten numbers of one-tile additions/removals, keyed by tehai. Shared
+    /// across all states that only differ in the wall.
+    plus_shanten_cache: ShantenDeltaCache,
+    minus_shanten_cache: ShantenDeltaCache,
+
     #[cfg(feature = "sp_reproduce_cpp_ver")]
     real_max_tsumo: usize,
 }
@@ -114,8 +125,11 @@ impl SPCalculator<'_> {
                             state,
                             tsumo_prob_table: &tsumo_prob_table,
                             not_tsumo_prob_table: &not_tsumo_prob_table,
-                            discard_cache: Default::default(),
-                            draw_cache: Default::default(),
+                            discard_cache: std::array::from_fn(|_| AHashMap::with_capacity(64)),
+                            draw_cache: std::array::from_fn(|_| AHashMap::with_capacity(64)),
+                            prob_cache: vec![None; (MAX_TILES_LEFT + 1) * 4],
+                            plus_shanten_cache: AHashMap::with_capacity(64),
+                            minus_shanten_cache: AHashMap::with_capacity(64),
                             #[cfg(feature = "sp_reproduce_cpp_ver")]
                             real_max_tsumo: tsumos_left as usize,
                         };
@@ -204,13 +218,14 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
         // 打牌候補を取得する。
         let discard_tiles = self
             .state
-            .get_discard_tiles(shanten, self.sup.tehai_len_div3);
+            .get_discard_tiles(shanten, self.sup.tehai_len_div3, &mut self.minus_shanten_cache);
 
         let mut candidates = Vec::with_capacity(discard_tiles.len());
         for DiscardTile { tile, shanten_diff } in discard_tiles {
             if shanten_diff == 0 {
                 self.state.discard(tile);
-                let required_tiles = self.state.get_required_tiles(self.sup.tehai_len_div3);
+                let required_tiles = self.state
+            .get_required_tiles(self.sup.tehai_len_div3, &mut self.plus_shanten_cache);
                 let values = self.draw(shanten);
                 self.state.undo_discard(tile);
 
@@ -233,7 +248,8 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
                 candidates.push(candidate);
             } else if self.sup.calc_shanten_down && shanten_diff == 1 && shanten < SHANTEN_THRES {
                 self.state.discard(tile);
-                let required_tiles = self.state.get_required_tiles(self.sup.tehai_len_div3);
+                let required_tiles = self.state
+            .get_required_tiles(self.sup.tehai_len_div3, &mut self.plus_shanten_cache);
                 self.state.n_extra_tsumo += 1;
                 let values = self.draw(shanten + 1);
                 self.state.n_extra_tsumo -= 1;
@@ -256,7 +272,8 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
     }
 
     fn analyze_draw(&mut self, shanten: i8) -> Vec<Candidate> {
-        let required_tiles = self.state.get_required_tiles(self.sup.tehai_len_div3);
+        let required_tiles = self.state
+            .get_required_tiles(self.sup.tehai_len_div3, &mut self.plus_shanten_cache);
         let values = self.draw(shanten);
 
         let mut tenpai_probs = values.tenpai_probs;
@@ -282,12 +299,13 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
         // 打牌候補を取得する。
         let discard_tiles = self
             .state
-            .get_discard_tiles(shanten, self.sup.tehai_len_div3);
+            .get_discard_tiles(shanten, self.sup.tehai_len_div3, &mut self.minus_shanten_cache);
         discard_tiles
             .into_iter()
             .map(|DiscardTile { tile, shanten_diff }| {
                 self.state.discard(tile);
-                let required_tiles = self.state.get_required_tiles(self.sup.tehai_len_div3);
+                let required_tiles = self.state
+            .get_required_tiles(self.sup.tehai_len_div3, &mut self.plus_shanten_cache);
                 self.state.undo_discard(tile);
 
                 Candidate::from(RawCandidate {
@@ -301,7 +319,8 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
     }
 
     fn analyze_draw_simple(&mut self) -> Vec<Candidate> {
-        let required_tiles = self.state.get_required_tiles(self.sup.tehai_len_div3);
+        let required_tiles = self.state
+            .get_required_tiles(self.sup.tehai_len_div3, &mut self.plus_shanten_cache);
         let candidate = Candidate::from(RawCandidate {
             tile: t!(?),
             required_tiles,
@@ -309,6 +328,38 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
             ..Default::default()
         });
         vec![candidate]
+    }
+
+    /// Returns the memoized `prob` triangle for the given `(sum_required_tiles,
+    /// count)` pair. Each cell is computed with the exact same expression and
+    /// operation order as the original inline computation, so the values are
+    /// bit-identical; they are merely computed once instead of per draw tile.
+    fn prob_triangle(
+        &mut self,
+        sum_required_tiles: u8,
+        count: u8,
+    ) -> &[[f32; MAX_TSUMO]; MAX_TSUMO] {
+        let idx = sum_required_tiles as usize * 4 + count as usize - 1;
+        if self.prob_cache[idx].is_none() {
+            let tsumo_probs = &self.tsumo_prob_table[count as usize - 1];
+            let not_tsumo_probs = &self.not_tsumo_prob_table[sum_required_tiles as usize];
+            let mut tri = Box::new([[0.; MAX_TSUMO]; MAX_TSUMO]);
+            for i in 0..MAX_TSUMO {
+                let m = not_tsumo_probs[i];
+                if m == 0. {
+                    break;
+                }
+                for j in i..MAX_TSUMO {
+                    let n = not_tsumo_probs[j];
+                    if n == 0. {
+                        break;
+                    }
+                    tri[i][j] = tsumo_probs[j] * n / m;
+                }
+            }
+            self.prob_cache[idx] = Some(tri);
+        }
+        self.prob_cache[idx].as_deref().unwrap()
     }
 
     fn draw(&mut self, shanten: i8) -> Rc<Values<MAX_TSUMO>> {
@@ -332,7 +383,8 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
         let mut exp_values = [0.; MAX_TSUMO];
 
         // 自摸候補を取得する。
-        let draw_tiles = self.state.get_draw_tiles(shanten, self.sup.tehai_len_div3);
+        let draw_tiles = self.state
+            .get_draw_tiles(shanten, self.sup.tehai_len_div3, &mut self.plus_shanten_cache);
 
         // 有効牌の合計枚数を計算する。【暫定対応】
         let sum_left_tiles = self.state.sum_left_tiles();
@@ -457,7 +509,8 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
         let mut exp_values = [0.; MAX_TSUMO];
 
         // 自摸候補を取得する。
-        let draw_tiles = self.state.get_draw_tiles(shanten, self.sup.tehai_len_div3);
+        let draw_tiles = self.state
+            .get_draw_tiles(shanten, self.sup.tehai_len_div3, &mut self.plus_shanten_cache);
 
         // 有効牌の合計枚数を計算する。
         let sum_required_tiles: u8 = draw_tiles
@@ -466,6 +519,10 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
             .map(|d| d.count)
             .sum();
         let not_tsumo_probs = &self.not_tsumo_prob_table[sum_required_tiles as usize];
+
+        let assume_riichi = self.sup.is_menzen && self.sup.prefer_riichi;
+        let calc_double_riichi = self.sup.calc_double_riichi;
+        let calc_haitei = self.sup.calc_haitei;
 
         for DrawTile {
             tile,
@@ -489,7 +546,7 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
             };
             self.state.undo_deal(tile);
 
-            let tsumo_probs = &self.tsumo_prob_table[count as usize - 1];
+            let probs = self.prob_triangle(sum_required_tiles, count);
             for i in 0..MAX_TSUMO {
                 let m = not_tsumo_probs[i];
                 if m == 0. {
@@ -510,19 +567,17 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
                         break;
                     }
                     // 現在の巡目が i の場合に j 巡目に有効牌を引く確率
-                    let prob = tsumo_probs[j] * n / m;
+                    let prob = probs[i][j];
 
                     match &scores_or_values {
                         ScoresOrValues::Scores(scores) => {
-                            let assume_riichi = self.sup.is_menzen && self.sup.prefer_riichi;
                             // 聴牌の場合は次で和了
                             // i 巡目で聴牌の場合はダブル立直成立
-                            let win_double_riichi =
-                                assume_riichi && self.sup.calc_double_riichi && i == 0;
+                            let win_double_riichi = assume_riichi && calc_double_riichi && i == 0;
                             // i 巡目で聴牌し、次の巡目で和了の場合は一発成立
                             let win_ippatsu = assume_riichi && j == i;
                             // 最後の巡目で和了の場合は海底撈月成立
-                            let win_haitei = self.sup.calc_haitei && j == MAX_TSUMO - 1;
+                            let win_haitei = calc_haitei && j == MAX_TSUMO - 1;
                             let han_plus = win_double_riichi as usize
                                 + win_ippatsu as usize
                                 + win_haitei as usize;
@@ -571,7 +626,7 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
         // 打牌候補を取得する。
         let discard_tiles = self
             .state
-            .get_discard_tiles(shanten, self.sup.tehai_len_div3);
+            .get_discard_tiles(shanten, self.sup.tehai_len_div3, &mut self.minus_shanten_cache);
 
         // 期待値が最大となる打牌を選択する。
         let mut max_tenpai_probs = [f32::MIN; MAX_TSUMO];
