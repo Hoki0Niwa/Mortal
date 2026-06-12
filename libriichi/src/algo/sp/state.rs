@@ -1,12 +1,49 @@
 use super::CALC_SHANTEN_FN;
 use super::tile::{DiscardTile, DrawTile, RequiredTile};
+use crate::algo::shanten::DeltaCalculator;
 use crate::tile::Tile;
 use crate::{must_tile, t, tu8};
 
+use ahash::AHashMap;
 use tinyvec::ArrayVec;
 
+/// Shanten numbers of one-tile modifications of a hand, memoized by the hand
+/// itself. The board state plays no role here, so entries can be shared
+/// between all `State`s that only differ in `tiles_in_wall`.
+pub(super) type ShantenDeltaCache = AHashMap<[u8; 34], [i8; 34]>;
+
+/// Delta-based equivalent of `CALC_SHANTEN_FN` for hands that differ from the
+/// `DeltaCalculator`'s base hand by one tile.
+#[cfg(feature = "sp_reproduce_cpp_ver")]
+fn delta_shanten(delta: &DeltaCalculator, tid: usize, plus: bool) -> i8 {
+    delta.calc_normal_delta(tid, plus)
+}
+#[cfg(not(feature = "sp_reproduce_cpp_ver"))]
+fn delta_shanten(delta: &DeltaCalculator, tid: usize, plus: bool) -> i8 {
+    delta.calc_all_delta(tid, plus)
+}
+
+/// `CALC_SHANTEN_FN` of `tehai` with one tile of `tid` added, for all 34 tids.
+fn shanten_deltas_plus(tehai: &[u8; 34], tehai_len_div3: u8) -> [i8; 34] {
+    let delta = DeltaCalculator::new(tehai, tehai_len_div3);
+    std::array::from_fn(|tid| delta_shanten(&delta, tid, true))
+}
+
+/// `CALC_SHANTEN_FN` of `tehai` with one tile of `tid` removed, for all 34
+/// tids present in the hand. Other entries are unusable and never read.
+fn shanten_deltas_minus(tehai: &[u8; 34], tehai_len_div3: u8) -> [i8; 34] {
+    let delta = DeltaCalculator::new(tehai, tehai_len_div3);
+    std::array::from_fn(|tid| {
+        if tehai[tid] > 0 {
+            delta_shanten(&delta, tid, false)
+        } else {
+            i8::MAX
+        }
+    })
+}
+
 /// Mutable state of both the hand and the board.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct State {
     // hand
     pub(super) tehai: [u8; 34],
@@ -50,6 +87,25 @@ impl From<InitState> for State {
             akas_in_wall,
             n_extra_tsumo: 0,
         }
+    }
+}
+
+/// Packs the whole state into a single buffer so the hasher gets one slice
+/// write instead of many per-field writes. The packing is injective, so this
+/// is consistent with the derived `PartialEq`.
+impl std::hash::Hash for State {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let mut buf = [0_u8; 70];
+        buf[..34].copy_from_slice(&self.tehai);
+        buf[34..68].copy_from_slice(&self.tiles_in_wall);
+        buf[68] = self.akas_in_hand[0] as u8
+            | (self.akas_in_hand[1] as u8) << 1
+            | (self.akas_in_hand[2] as u8) << 2
+            | (self.akas_in_wall[0] as u8) << 3
+            | (self.akas_in_wall[1] as u8) << 4
+            | (self.akas_in_wall[2] as u8) << 5;
+        buf[69] = self.n_extra_tsumo;
+        state.write(&buf);
     }
 }
 
@@ -100,25 +156,25 @@ impl State {
         &self,
         shanten: i8,
         tehai_len_div3: u8,
+        cache: &mut ShantenDeltaCache,
     ) -> ArrayVec<[DiscardTile; 14]> {
         let mut discard_tiles = ArrayVec::default();
 
-        let mut tehai = self.tehai;
-        for tid in 0..34 {
-            if tehai[tid] == 0 {
+        let deltas = cache
+            .entry(self.tehai)
+            .or_insert_with(|| shanten_deltas_minus(&self.tehai, tehai_len_div3));
+        for (tid, &count) in self.tehai.iter().enumerate() {
+            if count == 0 {
                 continue;
             }
 
-            tehai[tid] -= 1;
-            let shanten_after = CALC_SHANTEN_FN(&tehai, tehai_len_div3);
-            tehai[tid] += 1;
-
+            let shanten_after = deltas[tid];
             let shanten_diff = shanten_after - shanten;
 
             let tile = match tid as u8 {
-                tu8!(5m) if self.akas_in_hand[0] && tehai[tid] == 1 => t!(5mr),
-                tu8!(5p) if self.akas_in_hand[1] && tehai[tid] == 1 => t!(5pr),
-                tu8!(5s) if self.akas_in_hand[2] && tehai[tid] == 1 => t!(5sr),
+                tu8!(5m) if self.akas_in_hand[0] && count == 1 => t!(5mr),
+                tu8!(5p) if self.akas_in_hand[1] && count == 1 => t!(5pr),
+                tu8!(5s) if self.akas_in_hand[2] && count == 1 => t!(5sr),
                 _ => must_tile!(tid),
             };
 
@@ -132,19 +188,19 @@ impl State {
         &self,
         shanten: i8,
         tehai_len_div3: u8,
+        cache: &mut ShantenDeltaCache,
     ) -> ArrayVec<[DrawTile; 37]> {
         let mut draw_tiles = ArrayVec::default();
 
-        let mut tehai = self.tehai;
+        let deltas = cache
+            .entry(self.tehai)
+            .or_insert_with(|| shanten_deltas_plus(&self.tehai, tehai_len_div3));
         for (tid, &count) in self.tiles_in_wall.iter().enumerate() {
             if count == 0 {
                 continue;
             }
 
-            tehai[tid] += 1;
-            let shanten_after = CALC_SHANTEN_FN(&tehai, tehai_len_div3);
-            tehai[tid] -= 1;
-
+            let shanten_after = deltas[tid];
             let shanten_diff = shanten_after - shanten;
 
             let tile = must_tile!(tid);
@@ -174,21 +230,23 @@ impl State {
         draw_tiles
     }
 
-    pub(super) fn get_required_tiles(&self, tehai_len_div3: u8) -> ArrayVec<[RequiredTile; 34]> {
-        let mut tehai = self.tehai;
-
-        let shanten = CALC_SHANTEN_FN(&tehai, tehai_len_div3);
+    pub(super) fn get_required_tiles(
+        &self,
+        tehai_len_div3: u8,
+        cache: &mut ShantenDeltaCache,
+    ) -> ArrayVec<[RequiredTile; 34]> {
+        let shanten = CALC_SHANTEN_FN(&self.tehai, tehai_len_div3);
         let mut required_tiles = ArrayVec::default();
 
+        let deltas = cache
+            .entry(self.tehai)
+            .or_insert_with(|| shanten_deltas_plus(&self.tehai, tehai_len_div3));
         for (tid, &count) in self.tiles_in_wall.iter().enumerate() {
             if count == 0 {
                 continue;
             }
 
-            tehai[tid] += 1;
-            let shanten_after = CALC_SHANTEN_FN(&tehai, tehai_len_div3);
-            tehai[tid] -= 1;
-
+            let shanten_after = deltas[tid];
             if shanten_after < shanten {
                 required_tiles.push(RequiredTile {
                     tile: must_tile!(tid),
