@@ -7,6 +7,7 @@ def train():
     import gc
     import gzip
     import json
+    import math
     import shutil
     import random
     import time
@@ -40,6 +41,13 @@ def train():
     test_games = config['test_play']['games']
     gate_sigma = config['test_play'].get('gate_sigma', 0.0)
     min_q_weight = config['cql']['min_q_weight']
+    ol_cfg = config.get('offline_loss', {})
+    huber_delta = ol_cfg.get('huber_delta', 0.0)
+    awbc = ol_cfg.get('awbc', False)
+    awbc_beta = ol_cfg.get('awbc_beta', 1.0)
+    awbc_weight_clip = ol_cfg.get('awbc_weight_clip', 8.0)
+    awbc_normalize = ol_cfg.get('awbc_normalize', True)
+    awbc_log_clip = math.log(awbc_weight_clip) if awbc else 0.0
     next_rank_weight = config['aux']['next_rank_weight']
     metrics_every = config['control'].get('metrics_every', 1)
     async_save = config['control'].get('async_save', False)
@@ -162,6 +170,12 @@ def train():
 
     optimizer.zero_grad(set_to_none=True)
     mse = nn.MSELoss()
+    if huber_delta > 0:
+        # HuberLoss is 0.5*e^2 inside |e| <= delta, matching the 0.5*MSE scale
+        # of the default branch, so min_q_weight etc. keep their balance
+        q_criterion = nn.HuberLoss(delta=huber_delta)
+    else:
+        q_criterion = lambda input, target: 0.5 * mse(input, target)
     ce = nn.CrossEntropyLoss()
 
     if device.type == 'cuda':
@@ -202,6 +216,11 @@ def train():
         'train/logged_action_argmax_rate': 0,
         'train/policy_entropy': 0,
         'train/policy_entropy_norm': 0,
+        'train/awbc/adv_mean': 0,
+        'train/awbc/adv_std': 0,
+        'train/awbc/weight_std': 0,
+        'train/awbc/clip_rate': 0,
+        'train/awbc/ess': 0,
         'train/action_rate/discard': 0,
         'train/action_rate/riichi': 0,
         'train/action_rate/chi': 0,
@@ -431,14 +450,29 @@ def train():
             q_target_mc = gamma ** steps_to_done * kyoku_rewards
             q_target_mc = q_target_mc.to(torch.float32)
 
+            awbc_w = None
+            awbc_adv = None
             with torch.autocast(device.type, dtype=amp_dtype, enabled=enable_amp):
                 phi = mortal(obs)
                 q_out = dqn(phi, masks)
                 q = q_out[range(batch_size), actions]
-                dqn_loss = 0.5 * mse(q, q_target_mc)
+                dqn_loss = q_criterion(q, q_target_mc)
                 cql_loss = 0
                 if not online:
-                    cql_loss = q_out.logsumexp(-1).mean() - q.mean()
+                    if awbc:
+                        with torch.no_grad():
+                            # the dueling head's a_mean is taken over legal
+                            # actions, so the mean of legal Q is exactly its V
+                            # output; illegal entries are -inf and must go
+                            # through masked_fill, not multiplication
+                            v_b = q_out.detach().float().masked_fill(~masks, 0.).sum(-1) / masks.sum(-1)
+                            awbc_adv = q_target_mc - v_b
+                            awbc_w = (awbc_adv / awbc_beta).clamp(max=awbc_log_clip).exp()
+                            if awbc_normalize:
+                                awbc_w = awbc_w / awbc_w.mean()
+                        cql_loss = (awbc_w * (q_out.logsumexp(-1) - q)).mean()
+                    else:
+                        cql_loss = q_out.logsumexp(-1).mean() - q.mean()
 
                 next_rank_logits, = aux_net(phi)
                 next_rank_loss = ce(next_rank_logits, player_ranks)
@@ -502,6 +536,16 @@ def train():
                     metrics['train/logged_action_argmax_rate'] += (q_best_action == actions).to(torch.float32).mean()
                     metrics['train/policy_entropy'] += entropy.mean()
                     metrics['train/policy_entropy_norm'] += entropy_norm.mean()
+
+                    if awbc_w is not None:
+                        w_metric = awbc_w.float()
+                        metrics['train/awbc/adv_mean'] += awbc_adv.mean()
+                        metrics['train/awbc/adv_std'] += awbc_adv.std(unbiased=False)
+                        metrics['train/awbc/weight_std'] += w_metric.std(unbiased=False)
+                        metrics['train/awbc/clip_rate'] += ((awbc_adv / awbc_beta) >= awbc_log_clip).to(torch.float32).mean()
+                        # effective sample size ratio; near 0 means a few
+                        # samples dominate the BC term -> raise awbc_beta
+                        metrics['train/awbc/ess'] += w_metric.sum().square() / (w_metric.numel() * w_metric.square().sum())
 
                     metrics['train/action_rate/discard'] += (actions <= 36).to(torch.float32).mean()
                     metrics['train/action_rate/riichi'] += (actions == 37).to(torch.float32).mean()
@@ -724,6 +768,8 @@ def train():
                 writer.add_scalar('td/abs_p95', to_scalar(torch.quantile(all_td_abs.flatten(), 0.95)), steps)
                 for tag, value in metrics.items():
                     if version != 4 and tag.startswith('train/threat/'):
+                        continue
+                    if not awbc and tag.startswith('train/awbc/'):
                         continue
                     writer.add_scalar(tag, to_scalar(value / max(1, metrics_batches)), steps)
 

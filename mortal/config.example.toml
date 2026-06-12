@@ -91,6 +91,21 @@ min_q_weight = 5
 [aux]
 next_rank_weight = 0.2
 
+# Offline-only loss shaping. The whole section is optional and every key is
+# opt-in; the defaults below reproduce the old behavior exactly.
+[offline_loss]
+# 0 = 0.5*MSE (old behavior); >0 = Huber loss with this delta. The quadratic
+# region of Huber matches the 0.5*MSE scale, so other loss weights keep their
+# balance
+huber_delta = 0.0
+# weight the CQL/BC term per sample by exp(advantage / beta), where the
+# advantage is the MC return minus the dueling head's V (mean of legal Q,
+# detached). false = uniform weights (old behavior)
+awbc = false
+awbc_beta = 1.0          # temperature; raise it if train/awbc/ess drops below ~0.3
+awbc_weight_clip = 8.0   # upper bound of per-sample weights (clamped in log space)
+awbc_normalize = true    # normalize weights to mean 1 within each batch
+
 [freeze_bn]
 # `true` in online training
 mortal = false
