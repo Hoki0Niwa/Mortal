@@ -38,6 +38,7 @@ def train():
     test_every = config['control']['test_every']
     submit_every = config['control']['submit_every']
     test_games = config['test_play']['games']
+    gate_sigma = config['test_play'].get('gate_sigma', 0.0)
     min_q_weight = config['cql']['min_q_weight']
     next_rank_weight = config['aux']['next_rank_weight']
     metrics_every = config['control'].get('metrics_every', 1)
@@ -806,16 +807,37 @@ def train():
                     dqn.train()
 
                     avg_pt = stat.avg_pt([90, 45, 0, -135]) # for display only, never used in training
-                    better = avg_pt >= best_perf['avg_pt'] and stat.avg_rank <= best_perf['avg_rank']
+
+                    # closed-form multinomial standard errors of the rank
+                    # distribution, so improvements can be judged against
+                    # evaluation noise instead of raw point estimates
+                    rank_rates = (stat.rank_1_rate, stat.rank_2_rate, stat.rank_3_rate, stat.rank_4_rate)
+                    rank_sq_mean = sum(r * r * p for r, p in zip((1, 2, 3, 4), rank_rates))
+                    rank_se = (max(0., rank_sq_mean - stat.avg_rank ** 2) / max(1, stat.game)) ** 0.5
+                    pt_sq_mean = sum(pt * pt * p for pt, p in zip((90, 45, 0, -135), rank_rates))
+                    pt_se = (max(0., pt_sq_mean - avg_pt ** 2) / max(1, stat.game)) ** 0.5
+
+                    raw_better = avg_pt >= best_perf['avg_pt'] and stat.avg_rank <= best_perf['avg_rank']
+                    better = (
+                        avg_pt >= best_perf['avg_pt'] + gate_sigma * pt_se
+                        and stat.avg_rank <= best_perf['avg_rank'] - gate_sigma * rank_se
+                    )
+                    if raw_better and not better:
+                        logging.info(
+                            f'improvement is within the noise margin ({gate_sigma} SE), '
+                            'best record not updated'
+                        )
                     if better:
                         past_best = best_perf.copy()
                         best_perf['avg_pt'] = avg_pt
                         best_perf['avg_rank'] = stat.avg_rank
 
-                    logging.info(f'avg rank: {stat.avg_rank:.6}')
-                    logging.info(f'avg pt: {avg_pt:.6}')
+                    logging.info(f'avg rank: {stat.avg_rank:.6} (SE {rank_se:.4f}, 95% CI ±{1.96 * rank_se:.4f})')
+                    logging.info(f'avg pt: {avg_pt:.6} (SE {pt_se:.4f}, 95% CI ±{1.96 * pt_se:.4f})')
                     writer.add_scalar('test_play/avg_ranking', stat.avg_rank, steps)
                     writer.add_scalar('test_play/avg_pt', avg_pt, steps)
+                    writer.add_scalar('test_play/avg_ranking_se', rank_se, steps)
+                    writer.add_scalar('test_play/avg_pt_se', pt_se, steps)
                     writer.add_scalars('test_play/ranking', {
                         '1st': stat.rank_1_rate,
                         '2nd': stat.rank_2_rate,
@@ -872,7 +894,7 @@ def train():
                     # top-k candidate checkpoint management
                     if top_k > 0:
                         worst_rank = max(c['avg_rank'] for c in top_checkpoints) if top_checkpoints else float('inf')
-                        if len(top_checkpoints) < top_k or stat.avg_rank < worst_rank:
+                        if len(top_checkpoints) < top_k or stat.avg_rank < worst_rank - gate_sigma * rank_se:
                             os.makedirs(top_k_dir, exist_ok=True)
                             ckpt_path = path.join(top_k_dir, f'candidate_{steps}.pth')
                             shutil.copy(state_file, ckpt_path)

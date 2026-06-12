@@ -60,6 +60,11 @@ opponent_pool_prob = 0.0        # probability of using pool opponent (0.0 = alwa
 games = 3000
 aggregate_runs = 1              # run N independent test-play batches per evaluation
 log_dir = '/path/to/test_play'
+# require new results to beat the record by this many standard errors before
+# best/top-k checkpoints update; 0 = plain comparison (old behavior). The SE
+# itself is always computed and logged to tensorboard as
+# test_play/avg_ranking_se and test_play/avg_pt_se
+gate_sigma = 0.0
 
 [dataset]
 globs = ['/path/to/dataset/**/*.json.gz']
