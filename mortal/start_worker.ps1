@@ -7,9 +7,9 @@ param(
     [string]$TrainPlayProfile = 'default'
 )
 
-# Adjust these two paths on the main PC.
-$py  = 'C:\Users\user\miniconda3\envs\mortal\python.exe'
-$dir = 'C:\Users\user\git\Mortal\mortal'
+# Run from the mortal/ directory with the conda env activated.
+$py  = 'python'             # resolves to the activated conda env's python
+$dir = (Get-Location).Path  # current directory (run this from mortal/)
 
 $host.UI.RawUI.WindowTitle = "mortal-worker-$TrainPlayProfile"
 $env:TRAIN_PLAY_PROFILE = $TrainPlayProfile

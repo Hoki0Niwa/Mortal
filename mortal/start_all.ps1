@@ -1,9 +1,11 @@
 # Launch the resident Mortal stack (server + trainer + client) on this PC.
 # Each process gets its own window with an auto-restart loop for 24/7 operation.
-# Run:  powershell -ExecutionPolicy Bypass -File start_all.ps1
+# Run from the mortal/ directory with the conda env activated:
+#   conda activate mortal
+#   powershell -ExecutionPolicy Bypass -File start_all.ps1
 
-$py  = 'C:\Users\user\miniconda3\envs\mortal\python.exe'
-$dir = 'C:\Users\user\git\Mortal\mortal'
+$py  = 'python'             # resolves to the activated conda env's python
+$dir = (Get-Location).Path  # current directory (run this from mortal/)
 
 function Start-Loop {
     param([string]$Title, [string]$Script, [string]$Pre = '')
