@@ -47,6 +47,8 @@ def train():
     awbc_beta = ol_cfg.get('awbc_beta', 1.0)
     awbc_weight_clip = ol_cfg.get('awbc_weight_clip', 8.0)
     awbc_normalize = ol_cfg.get('awbc_normalize', True)
+    awbc_baseline = ol_cfg.get('awbc_baseline', False)
+    assert awbc or not awbc_baseline, 'awbc_baseline requires awbc'
     awbc_log_clip = math.log(awbc_weight_clip) if awbc else 0.0
     next_rank_weight = config['aux']['next_rank_weight']
     metrics_every = config['control'].get('metrics_every', 1)
@@ -89,6 +91,26 @@ def train():
     logging.info(f'aux params: {parameter_count(aux_net):,}')
 
     mortal.freeze_bn(config['freeze_bn']['mortal'])
+
+    baseline_net = None
+    baseline_head = None
+    use_oracle = awbc_baseline and not online
+    if use_oracle:
+        b_cfg = config['awbc_baseline']
+        b_state = torch.load(b_cfg['state_file'], weights_only=True, map_location=device)
+        assert b_state['version'] == version, 'awbc baseline was trained for a different obs version'
+        baseline_net = Brain(version=version, is_oracle=True, **b_state['network']).to(device).eval()
+        baseline_head = nn.Linear(1024, 1).to(device).eval()
+        baseline_net.load_state_dict(b_state['brain'])
+        baseline_head.load_state_dict(b_state['head'])
+        for param in baseline_net.parameters():
+            param.requires_grad_(False)
+        for param in baseline_head.parameters():
+            param.requires_grad_(False)
+        logging.info(
+            f"loaded awbc baseline: valid_loss={b_state.get('valid_loss', float('nan')):.4f}, "
+            f"unexplained_var={b_state.get('unexplained_var', float('nan')):.3f}"
+        )
 
     decay_params = []
     no_decay_params = []
@@ -168,6 +190,17 @@ def train():
         if 'top_checkpoints' in state:
             top_checkpoints = [c for c in state['top_checkpoints'] if path.exists(c['filepath'])]
 
+        # candidates written right before a crash are not in the persisted
+        # list and would otherwise leak forever; drop them on resume
+        if path.isdir(top_k_dir):
+            known = {path.basename(c['filepath']) for c in top_checkpoints}
+            for filename in os.listdir(top_k_dir):
+                if filename.startswith('candidate_') and filename.endswith('.pth') and filename not in known:
+                    os.remove(path.join(top_k_dir, filename))
+                    logging.info(f'removed orphan candidate {filename}')
+    elif path.isdir(top_k_dir) and len(os.listdir(top_k_dir)) > 0:
+        logging.warning(f'{top_k_dir} is not empty but there is no state to resume from; leaving it untouched')
+
     optimizer.zero_grad(set_to_none=True)
     mse = nn.MSELoss()
     if huber_delta > 0:
@@ -221,6 +254,7 @@ def train():
         'train/awbc/weight_std': 0,
         'train/awbc/clip_rate': 0,
         'train/awbc/ess': 0,
+        'train/awbc/baseline_unexplained_var': 0,
         'train/action_rate/discard': 0,
         'train/action_rate/riichi': 0,
         'train/action_rate/chi': 0,
@@ -398,6 +432,7 @@ def train():
             random.shuffle(file_list)
         file_data = FileDatasetsIter(
             version = version,
+            oracle = use_oracle,
             file_list = file_list,
             pts = pts,
             file_batch_size = file_batch_size,
@@ -416,22 +451,21 @@ def train():
             worker_init_fn = worker_init_fn,
         ))
 
-        remaining_obs = []
-        remaining_actions = []
-        remaining_masks = []
-        remaining_steps_to_done = []
-        remaining_kyoku_rewards = []
-        remaining_player_ranks = []
-        remaining_at_turns = []
-        remaining_shantens = []
+        remaining = []
         remaining_bs = 0
         pb = tqdm(total=save_every, desc='TRAIN', initial=steps % save_every)
 
-        def train_batch(obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks, at_turns, shantens):
+        def train_batch(*batch):
             nonlocal steps
             nonlocal idx
             nonlocal pb
             nonlocal metrics_batches
+
+            if use_oracle:
+                obs, invisible_obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks, at_turns, shantens = batch
+            else:
+                obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks, at_turns, shantens = batch
+                invisible_obs = None
 
             # non_blocking pairs with the DataLoader's pin_memory to overlap
             # H2D transfers with compute; results are identical
@@ -443,6 +477,8 @@ def train():
             player_ranks = player_ranks.to(dtype=torch.int64, device=device, non_blocking=True)
             at_turns = at_turns.to(dtype=torch.float32, device=device, non_blocking=True)
             shantens = shantens.to(dtype=torch.int64, device=device, non_blocking=True)
+            if invisible_obs is not None:
+                invisible_obs = invisible_obs.to(dtype=torch.float32, device=device, non_blocking=True)
             detailed_metrics = metrics_every <= 1 or steps % metrics_every == 0
             if detailed_metrics:
                 assert masks[range(batch_size), actions].all()
@@ -461,12 +497,21 @@ def train():
                 if not online:
                     if awbc:
                         with torch.no_grad():
-                            # the dueling head's a_mean is taken over legal
-                            # actions, so the mean of legal Q is exactly its V
-                            # output; illegal entries are -inf and must go
-                            # through masked_fill, not multiplication
-                            v_b = q_out.detach().float().masked_fill(~masks, 0.).sum(-1) / masks.sum(-1)
-                            awbc_adv = q_target_mc - v_b
+                            if baseline_net is not None:
+                                # the luck baseline estimates the return from the
+                                # state plus the hidden information (wall order,
+                                # opponents' hands), so the advantage below is the
+                                # part of the return the realized luck does not
+                                # explain
+                                b_out = baseline_head(baseline_net(obs, invisible_obs)).squeeze(-1).float()
+                                awbc_adv = q_target_mc - b_out
+                            else:
+                                # the dueling head's a_mean is taken over legal
+                                # actions, so the mean of legal Q is exactly its V
+                                # output; illegal entries are -inf and must go
+                                # through masked_fill, not multiplication
+                                v_b = q_out.detach().float().masked_fill(~masks, 0.).sum(-1) / masks.sum(-1)
+                                awbc_adv = q_target_mc - v_b
                             awbc_w = (awbc_adv / awbc_beta).clamp(max=awbc_log_clip).exp()
                             if awbc_normalize:
                                 awbc_w = awbc_w / awbc_w.mean()
@@ -546,6 +591,10 @@ def train():
                         # effective sample size ratio; near 0 means a few
                         # samples dominate the BC term -> raise awbc_beta
                         metrics['train/awbc/ess'] += w_metric.sum().square() / (w_metric.numel() * w_metric.square().sum())
+                        if baseline_net is not None:
+                            target_var = q_target_mc.var(unbiased=False)
+                            if target_var > 0:
+                                metrics['train/awbc/baseline_unexplained_var'] += awbc_adv.var(unbiased=False) / target_var
 
                     metrics['train/action_rate/discard'] += (actions <= 36).to(torch.float32).mean()
                     metrics['train/action_rate/riichi'] += (actions == 37).to(torch.float32).mean()
@@ -771,6 +820,8 @@ def train():
                         continue
                     if not awbc and tag.startswith('train/awbc/'):
                         continue
+                    if not use_oracle and tag == 'train/awbc/baseline_unexplained_var':
+                        continue
                     writer.add_scalar(tag, to_scalar(value / max(1, metrics_batches)), steps)
 
                 opt_count = opt_metrics['count']
@@ -925,9 +976,13 @@ def train():
                     writer.flush()
 
                     if better:
-                        if not async_save:
-                            # with async_save the same state is already fully
-                            # written to state_file (joined above)
+                        # best_perf was mutated above, after the checkpoint was
+                        # written, so it must be re-saved either way; the async
+                        # snapshot queued earlier still holds the old record
+                        if async_save:
+                            queue_save(state_to_cpu(state), state_file)
+                            join_save()
+                        else:
                             torch.save(state, state_file)
                         logging.info(
                             'a new record has been made, '
@@ -968,44 +1023,21 @@ def train():
                 perf['block_t0'] = time.monotonic()
                 pb = tqdm(total=save_every, desc='TRAIN')
 
-        for obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks, at_turns, shantens in data_loader:
-            bs = obs.shape[0]
+        for batch in data_loader:
+            bs = batch[0].shape[0]
             if bs != batch_size:
-                remaining_obs.append(obs)
-                remaining_actions.append(actions)
-                remaining_masks.append(masks)
-                remaining_steps_to_done.append(steps_to_done)
-                remaining_kyoku_rewards.append(kyoku_rewards)
-                remaining_player_ranks.append(player_ranks)
-                remaining_at_turns.append(at_turns)
-                remaining_shantens.append(shantens)
+                remaining.append(batch)
                 remaining_bs += bs
                 continue
-            train_batch(obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks, at_turns, shantens)
+            train_batch(*batch)
 
         remaining_batches = remaining_bs // batch_size
         if remaining_batches > 0:
-            obs = torch.cat(remaining_obs, dim=0)
-            actions = torch.cat(remaining_actions, dim=0)
-            masks = torch.cat(remaining_masks, dim=0)
-            steps_to_done = torch.cat(remaining_steps_to_done, dim=0)
-            kyoku_rewards = torch.cat(remaining_kyoku_rewards, dim=0)
-            player_ranks = torch.cat(remaining_player_ranks, dim=0)
-            at_turns = torch.cat(remaining_at_turns, dim=0)
-            shantens = torch.cat(remaining_shantens, dim=0)
+            fields = [torch.cat(f, dim=0) for f in zip(*remaining)]
             start = 0
             end = batch_size
             while end <= remaining_bs:
-                train_batch(
-                    obs[start:end],
-                    actions[start:end],
-                    masks[start:end],
-                    steps_to_done[start:end],
-                    kyoku_rewards[start:end],
-                    player_ranks[start:end],
-                    at_turns[start:end],
-                    shantens[start:end],
-                )
+                train_batch(*(f[start:end] for f in fields))
                 start = end
                 end += batch_size
         pb.close()

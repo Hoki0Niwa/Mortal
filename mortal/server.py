@@ -79,7 +79,8 @@ class Handler(BaseRequestHandler):
     def handle_submit_replay(self, msg):
         with S.dir_lock:
             for filename, content in msg['logs'].items():
-                filepath = path.join(S.buffer_dir, f'{S.submission_id}_{filename}')
+                # basename guards against path traversal from remote workers
+                filepath = path.join(S.buffer_dir, f'{S.submission_id}_{path.basename(filename)}')
                 with open(filepath, 'wb') as f:
                     f.write(content)
             S.buffer_size += len(msg['logs'])

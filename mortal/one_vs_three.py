@@ -5,6 +5,7 @@ import torch
 import secrets
 import os
 from engine import build_engine_from_state
+from checkpoint import load_checkpoint
 from libriichi.arena import OneVsThree
 from config import config
 
@@ -23,7 +24,7 @@ def main():
         os.environ['AKOCHAN_DIR'] = cfg['akochan']['dir']
         os.environ['AKOCHAN_TACTICS'] = cfg['akochan']['tactics']
     else:
-        state = torch.load(cfg['champion']['state_file'], weights_only=True, map_location=torch.device('cpu'))
+        state = load_checkpoint(cfg['champion']['state_file'])
         engine_cham, cham_info = build_engine_from_state(
             state,
             device=torch.device(cfg['champion']['device']),
@@ -34,7 +35,7 @@ def main():
         )
         print(f"loaded champion ({cham_info['head_kind']}, norm={cham_info['norm']})")
 
-    state = torch.load(cfg['challenger']['state_file'], weights_only=True, map_location=torch.device('cpu'))
+    state = load_checkpoint(cfg['challenger']['state_file'])
     engine_chal, chal_info = build_engine_from_state(
         state,
         device=torch.device(cfg['challenger']['device']),

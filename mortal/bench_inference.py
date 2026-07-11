@@ -17,6 +17,7 @@ import time
 import numpy as np
 import torch
 from engine import build_engine_from_state
+from checkpoint import load_checkpoint
 from libriichi.consts import obs_shape, ACTION_SPACE
 from config import config
 
@@ -69,7 +70,7 @@ def main():
 
     device = torch.device(config['control']['device'])
     assert device.type == 'cuda', 'this benchmark targets CUDA devices'
-    state = torch.load(args.state, weights_only=False, map_location=torch.device('cpu'))
+    state = load_checkpoint(args.state)
     version = state['config']['control'].get('version', 1)
     channels = obs_shape(version)[0]
     logging.info(f'state: {args.state} (v{version}, {channels} channels)')

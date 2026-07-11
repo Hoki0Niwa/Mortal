@@ -11,6 +11,7 @@ Usage:
 import os
 import sys
 import torch
+from checkpoint import load_checkpoint
 
 KEEP_KEYS = ('mortal', 'current_dqn', 'policy_net', 'config')
 
@@ -22,7 +23,7 @@ def main():
     dst = sys.argv[2] if len(sys.argv) > 2 else src
     before = os.path.getsize(src)
 
-    state = torch.load(src, weights_only=False, map_location=torch.device('cpu'))
+    state = load_checkpoint(src)
     stripped = {k: state[k] for k in KEEP_KEYS if k in state}
     assert 'mortal' in stripped, "checkpoint has no 'mortal' key"
     assert 'current_dqn' in stripped or 'policy_net' in stripped, \

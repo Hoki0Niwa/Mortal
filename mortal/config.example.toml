@@ -105,6 +105,38 @@ awbc = false
 awbc_beta = 1.0          # temperature; raise it if train/awbc/ess drops below ~0.3
 awbc_weight_clip = 8.0   # upper bound of per-sample weights (clamped in log space)
 awbc_normalize = true    # normalize weights to mean 1 within each batch
+# replace the dueling-V advantage with `return - b(state, hidden info)` where b
+# is the oracle luck baseline trained by train_baseline.py; requires awbc = true
+awbc_baseline = false
+
+# Oracle luck baseline b(state, hidden info) for luck-corrected AWBC. Train it
+# with train_baseline.py first; enable via offline_loss.awbc_baseline. Proceed
+# only if the reported unexplained variance ratio clearly beats the ~0.95
+# linear-probe floor (see the train_baseline.py docstring).
+[awbc_baseline]
+state_file = '/path/to/awbc_baseline.pth'
+
+# must match the main [resnet] when init_state_file is used
+[awbc_baseline.network]
+conv_channels = 192
+num_blocks = 40
+
+[awbc_baseline.train]
+batch_size = 256
+# optional warm start from a trained main checkpoint (its 'mortal' brain);
+# strongly recommended - training b(s, z) from scratch underperformed even a
+# 9-feature linear probe. The first conv's extra oracle input channels are
+# zero-initialized, so at step 0 the model behaves like the source trunk.
+#init_state_file = '/path/to/main_checkpoint.pth'
+lr = 3e-4                # use ~1e-4 when warm starting
+warmup_steps = 500       # linear LR ramp protecting the trunk from the fresh head
+weight_decay = 0.01
+huber_delta = 1.0        # 0 = 0.5*MSE
+valid_files = 64         # files held out for validation / early stopping
+eval_every = 2000        # optimizer steps between validation passes
+patience = 5             # stop after this many validations without improvement
+max_steps = 200000
+tensorboard_dir = ''     # empty = disabled
 
 [freeze_bn]
 # `true` in online training

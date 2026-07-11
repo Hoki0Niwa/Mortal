@@ -8,6 +8,7 @@ import random
 import time
 from os import path
 from engine import MortalEngine, resolve_amp_dtype, build_engine_from_state
+from checkpoint import load_checkpoint
 from libriichi.stat import Stat
 from libriichi.arena import OneVsThree
 from config import config
@@ -46,7 +47,7 @@ class TestPlayer:
         baseline_cfg = config['baseline']['test']
         device = torch.device(baseline_cfg['device'])
 
-        state = torch.load(baseline_cfg['state_file'], weights_only=False, map_location=torch.device('cpu'))
+        state = load_checkpoint(baseline_cfg['state_file'])
         self.baseline_engine, info = build_engine_from_state(
             state,
             device=device,
@@ -128,7 +129,7 @@ class TrainPlayer:
         baseline_cfg = config['baseline']['train']
         device = torch.device(baseline_cfg['device'])
 
-        state = torch.load(baseline_cfg['state_file'], weights_only=False, map_location=torch.device('cpu'))
+        state = load_checkpoint(baseline_cfg['state_file'])
         self.baseline_engine, info = build_engine_from_state(
             state,
             device=device,
@@ -168,7 +169,7 @@ class TrainPlayer:
         chosen = path.join(pool_dir, random.choice(candidates))
         try:
             t_load = time.monotonic()
-            state = torch.load(chosen, weights_only=False, map_location=torch.device('cpu'))
+            state = load_checkpoint(chosen)
             engine, info = build_engine_from_state(
                 state,
                 device=device,
@@ -187,57 +188,58 @@ class TrainPlayer:
 
     def train_play(self, mortal, dqn, device):
         torch.backends.cudnn.benchmark = play_cudnn_benchmark()
-        engine_chal = MortalEngine(
-            mortal,
-            dqn,
-            is_oracle = False,
-            version = self.chal_version,
-            boltzmann_epsilon = self.boltzmann_epsilon,
-            boltzmann_temp = self.boltzmann_temp,
-            top_p = self.top_p,
-            device = device,
-            enable_amp = True,
-            amp_dtype = self.chal_amp_dtype,
-            name = 'trainee',
-            # the client's models are local inference copies, so weight
-            # casting is safe here (load_state_dict re-casts on each update)
-            **perf_engine_kwargs(allow_weights_cast=True),
-        )
+        try:
+            engine_chal = MortalEngine(
+                mortal,
+                dqn,
+                is_oracle = False,
+                version = self.chal_version,
+                boltzmann_epsilon = self.boltzmann_epsilon,
+                boltzmann_temp = self.boltzmann_temp,
+                top_p = self.top_p,
+                device = device,
+                enable_amp = True,
+                amp_dtype = self.chal_amp_dtype,
+                name = 'trainee',
+                # the client's models are local inference copies, so weight
+                # casting is safe here (load_state_dict re-casts on each update)
+                **perf_engine_kwargs(allow_weights_cast=True),
+            )
 
-        opponent = self.baseline_engine
-        if self.opponent_pool_prob > 0 and random.random() < self.opponent_pool_prob:
-            pool_opponent = self._load_pool_opponent(device)
-            if pool_opponent is not None:
-                opponent = pool_opponent
+            opponent = self.baseline_engine
+            if self.opponent_pool_prob > 0 and random.random() < self.opponent_pool_prob:
+                pool_opponent = self._load_pool_opponent(device)
+                if pool_opponent is not None:
+                    opponent = pool_opponent
 
-        if path.isdir(self.log_dir):
-            shutil.rmtree(self.log_dir)
+            if path.isdir(self.log_dir):
+                shutil.rmtree(self.log_dir)
 
-        env = OneVsThree(
-            disable_progress_bar = False,
-            log_dir = self.log_dir,
-        )
-        t_play = time.monotonic()
-        rankings = env.py_vs_py(
-            challenger = engine_chal,
-            champion = opponent,
-            seed_start = (self.train_seed, self.train_key),
-            seed_count = self.seed_count,
-        )
-        play_secs = time.monotonic() - t_play
-        games = self.seed_count * 4
-        logging.info(
-            f'train_play: {games:,} games in {play_secs:.1f}s '
-            f'({games / play_secs * 3600:,.0f} games/h)'
-        )
-        log_react_stats(engine_chal, opponent)
-        self.repeat_counter += 1
-        if self.repeat_counter == self.repeats:
-            self.train_seed += self.seed_count
-            self.repeat_counter = 0
+            env = OneVsThree(
+                disable_progress_bar = False,
+                log_dir = self.log_dir,
+            )
+            t_play = time.monotonic()
+            rankings = env.py_vs_py(
+                challenger = engine_chal,
+                champion = opponent,
+                seed_start = (self.train_seed, self.train_key),
+                seed_count = self.seed_count,
+            )
+            play_secs = time.monotonic() - t_play
+            games = self.seed_count * 4
+            logging.info(
+                f'train_play: {games:,} games in {play_secs:.1f}s '
+                f'({games / play_secs * 3600:,.0f} games/h)'
+            )
+            log_react_stats(engine_chal, opponent)
+            self.repeat_counter += 1
+            if self.repeat_counter == self.repeats:
+                self.train_seed += self.seed_count
+                self.repeat_counter = 0
 
-        rankings = np.array(rankings)
-        file_list = list(map(lambda p: path.join(self.log_dir, p), os.listdir(self.log_dir)))
-
-        torch.backends.cudnn.benchmark = config['control']['enable_cudnn_benchmark']
-        return rankings, file_list
+            rankings = np.array(rankings)
+            file_list = list(map(lambda p: path.join(self.log_dir, p), os.listdir(self.log_dir)))
+            return rankings, file_list
+        finally:
+            torch.backends.cudnn.benchmark = config['control']['enable_cudnn_benchmark']
