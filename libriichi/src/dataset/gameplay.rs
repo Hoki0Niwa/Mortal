@@ -36,6 +36,12 @@ pub struct GameplayLoader {
     always_include_kan_select: bool,
     #[pyo3(get)]
     augmented: bool,
+    /// When set, every entry also gets a 37-dim per-discard single-player EV
+    /// vector (see `PlayerState::sp_discard_evs`); NaN-filled when
+    /// unavailable. Roughly doubles the SP calculation cost per discard
+    /// decision, hence opt-in.
+    #[pyo3(get)]
+    emit_sp_labels: bool,
 
     #[derivative(Debug = "ignore")]
     player_names_set: AHashSet<String>,
@@ -56,6 +62,8 @@ pub struct Gameplay {
     pub apply_gamma: Vec<bool>,
     pub at_turns: Vec<u8>,
     pub shantens: Vec<i8>,
+    /// Only populated when `emit_sp_labels` is set; same length as `obs`.
+    pub sp_ev_labels: Vec<Array1<f32>>,
 
     // per game
     pub grp: Grp, // actually per kyoku though
@@ -89,6 +97,7 @@ impl GameplayLoader {
         trust_seed = false,
         always_include_kan_select = true,
         augmented = false,
+        emit_sp_labels = false,
     ))]
     fn new(
         version: u32,
@@ -98,6 +107,7 @@ impl GameplayLoader {
         trust_seed: bool,
         always_include_kan_select: bool,
         augmented: bool,
+        emit_sp_labels: bool,
     ) -> Self {
         let player_names = player_names.unwrap_or_default();
         let player_names_set = player_names.iter().cloned().collect();
@@ -111,6 +121,7 @@ impl GameplayLoader {
             trust_seed,
             always_include_kan_select,
             augmented,
+            emit_sp_labels,
             player_names_set,
             excludes_set,
         }
@@ -225,6 +236,12 @@ impl Gameplay {
     }
     fn take_shantens(&mut self) -> Vec<i8> {
         mem::take(&mut self.shantens)
+    }
+    fn take_sp_ev_labels<'py>(&mut self, py: Python<'py>) -> Vec<Bound<'py, PyArray1<f32>>> {
+        mem::take(&mut self.sp_ev_labels)
+            .into_iter()
+            .map(|v| PyArray1::from_owned_array(py, v))
+            .collect()
     }
 
     fn take_grp(&mut self) -> Grp {
@@ -429,6 +446,19 @@ impl Gameplay {
         self.apply_gamma.push(label <= 37);
         self.at_turns.push(ctx.state.at_turn());
         self.shantens.push(ctx.state.shanten());
+
+        if ctx.config.emit_sp_labels {
+            let evs = if at_kan_select {
+                None
+            } else {
+                ctx.state.sp_discard_evs()
+            };
+            let arr = match evs {
+                Some(evs) => Array1::from_iter(evs),
+                None => Array1::from_elem(37, f32::NAN),
+            };
+            self.sp_ev_labels.push(arr);
+        }
 
         if let Some(invisibles) = ctx.invisibles {
             let invisible_obs = invisibles[ctx.kyoku_idx].encode(

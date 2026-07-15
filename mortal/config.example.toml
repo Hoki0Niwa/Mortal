@@ -76,6 +76,24 @@ player_names_files = []
 num_epochs = 1
 enable_augmentation = false
 augmented_first = false
+# files listed here (one path per line) are excluded from training and reserved
+# for the decision-point benchmark suite (see [suite])
+#holdout_files = '/path/to/holdout_files.txt'
+
+# Decision-point benchmark suite (suite.py). Scores checkpoints on decision
+# points from dataset.holdout_files; runs automatically at every test_every
+# boundary and logs under suite/* in tensorboard.
+[suite]
+enabled = false
+file_batch_size = 10
+batch_size = 1024
+max_files = 0           # 0 = use every holdout file
+# Single-player (SP) discard metrics (suite/sp/*): agreement between the
+# model's argmax and the SP max-EV discard, plus the SP EV lost by the chosen
+# discard. Uses GameplayLoader(emit_sp_labels=true), which roughly doubles the
+# SP calculation cost of loading the holdout files, hence opt-in.
+# Single runs can force it with `python suite.py --sp`.
+sp_metrics = false
 
 [env]
 gamma = 1

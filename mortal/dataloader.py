@@ -21,6 +21,7 @@ class FileDatasetsIter(IterableDataset):
         num_epochs = 1,
         enable_augmentation = False,
         augmented_first = False,
+        include_sp_labels = False,
     ):
         super().__init__()
         self.version = version
@@ -34,6 +35,10 @@ class FileDatasetsIter(IterableDataset):
         self.num_epochs = num_epochs
         self.enable_augmentation = enable_augmentation
         self.augmented_first = augmented_first
+        # appends a 37-dim per-discard SP EV vector (NaN where unavailable)
+        # as the last element of every entry; costs extra SP calculation in
+        # the loader, so keep it off for training
+        self.include_sp_labels = include_sp_labels
         self.iterator = None
 
     def build_iter(self):
@@ -52,12 +57,16 @@ class FileDatasetsIter(IterableDataset):
         # shuffle the file list for each epoch
         random.shuffle(self.file_list)
 
+        # only pass the kwarg when requested so that a libriichi.pyd built
+        # before emit_sp_labels existed keeps working for training
+        extra_kwargs = {'emit_sp_labels': True} if self.include_sp_labels else {}
         self.loader = GameplayLoader(
             version = self.version,
             oracle = self.oracle,
             player_names = self.player_names,
             excludes = self.excludes,
             augmented = augmented,
+            **extra_kwargs,
         )
         self.buffer = []
 
@@ -92,6 +101,8 @@ class FileDatasetsIter(IterableDataset):
                 apply_gamma = game.take_apply_gamma()
                 at_turns = game.take_at_turns()
                 shantens = game.take_shantens()
+                if self.include_sp_labels:
+                    sp_ev_labels = game.take_sp_ev_labels()
 
                 # per game
                 grp = game.take_grp()
@@ -127,6 +138,8 @@ class FileDatasetsIter(IterableDataset):
                     ]
                     if self.oracle:
                         entry.insert(1, invisible_obs[i])
+                    if self.include_sp_labels:
+                        entry.append(sp_ev_labels[i])
                     self.buffer.append(entry)
 
     def __iter__(self):

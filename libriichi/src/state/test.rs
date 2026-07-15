@@ -1416,3 +1416,60 @@ fn chi_at_0_shanten() {
     assert!(ps.at_furiten);
     assert!(!ps.has_next_shanten_discard);
 }
+
+#[test]
+fn sp_discard_evs_basic() {
+    // Tenpai after tsumo: 123456m 3p78p 456s NN, waiting on 6p/9p after
+    // discarding 3p. Discarding N is a shanten down.
+    let log = r#"
+        {"type":"start_kyoku","bakaze":"E","dora_marker":"2s","kyoku":1,"honba":0,"kyotaku":0,"oya":0,"scores":[25000,25000,25000,25000],"tehais":[["1m","2m","3m","4m","5m","6m","7p","8p","4s","5s","6s","N","N"],["?","?","?","?","?","?","?","?","?","?","?","?","?"],["?","?","?","?","?","?","?","?","?","?","?","?","?"],["?","?","?","?","?","?","?","?","?","?","?","?","?"]]}
+        {"type":"tsumo","actor":0,"pai":"3p"}
+    "#;
+    let ps = PlayerState::from_log(0, log);
+    assert!(ps.last_cans.can_discard);
+
+    let evs = ps.sp_discard_evs().unwrap();
+
+    // Finite EVs may only appear on tiles that are actually discardable.
+    let candidates = ps.discard_candidates_aka();
+    for (idx, ev) in evs.iter().enumerate() {
+        if ev.is_finite() {
+            assert!(candidates[idx], "non-discardable tile {idx} has an EV");
+        }
+    }
+
+    // Keep-shanten discard has an EV, shanten-down discard does not.
+    assert!(evs[tuz!(3p)].is_finite());
+    assert!(evs[tuz!(N)].is_nan());
+
+    // The best label EV must be the head of the sorted max-EV table.
+    let table = ps.single_player_tables().unwrap().max_ev_table;
+    let max_ev = evs.iter().copied().filter(|v| v.is_finite()).fold(f32::MIN, f32::max);
+    assert!(max_ev > 0.);
+    assert_eq!(evs[table[0].tile.as_usize()], max_ev);
+    assert_eq!(evs[table[0].tile.as_usize()], table[0].exp_values[0]);
+}
+
+#[test]
+fn sp_discard_evs_none_cases() {
+    // Tenpai hand that declares riichi.
+    let log = r#"
+        {"type":"start_kyoku","bakaze":"E","dora_marker":"2s","kyoku":1,"honba":0,"kyotaku":0,"oya":0,"scores":[25000,25000,25000,25000],"tehais":[["1m","2m","3m","4m","5m","6m","7m","8m","9m","7p","8p","N","N"],["?","?","?","?","?","?","?","?","?","?","?","?","?"],["?","?","?","?","?","?","?","?","?","?","?","?","?"],["?","?","?","?","?","?","?","?","?","?","?","?","?"]]}
+        {"type":"tsumo","actor":0,"pai":"3s"}
+        {"type":"reach","actor":0}
+        {"type":"dahai","actor":0,"pai":"3s","tsumogiri":true}
+        {"type":"reach_accepted","actor":0}
+        {"type":"tsumo","actor":1,"pai":"?"}
+        {"type":"dahai","actor":1,"pai":"C","tsumogiri":true}
+    "#;
+    let mut ps = PlayerState::from_log(0, log);
+
+    // Not our turn: no discard decision, no labels.
+    assert!(!ps.last_cans.can_discard);
+    assert!(ps.sp_discard_evs().is_none());
+
+    // Own riichi accepted: tsumogiri only, no real choice, no labels.
+    let cans = ps.test_update_json(r#"{"type":"tsumo","actor":0,"pai":"W"}"#);
+    assert!(cans.can_discard);
+    assert!(ps.sp_discard_evs().is_none());
+}

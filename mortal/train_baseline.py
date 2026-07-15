@@ -83,7 +83,8 @@ def main():
     # build the file list (same logic as the offline branch in train.py)
     player_names_set = set()
     for filename in config['dataset']['player_names_files']:
-        with open(filename) as f:
+        # utf-8-sig also strips the BOM some editors prepend (see train.py)
+        with open(filename, encoding='utf-8-sig') as f:
             player_names_set.update(filtered_trimmed_lines(f))
     player_names = list(player_names_set)
     logging.info(f'loaded {len(player_names):,} players')
@@ -100,13 +101,23 @@ def main():
         if len(player_names_set) > 0:
             filtered = []
             for filename in tqdm(file_list, unit='file'):
-                with gzip.open(filename, 'rt') as f:
+                with gzip.open(filename, 'rt', encoding='utf-8') as f:
                     start = json.loads(next(f))
                     if not set(start['names']).isdisjoint(player_names_set):
                         filtered.append(filename)
             file_list = filtered
         file_list.sort(reverse=True)
         torch.save({'file_list': file_list}, file_index)
+
+    # same holdout exclusion as train.py; the suite files must never be used
+    # for any kind of training
+    holdout_path = config['dataset'].get('holdout_files', '')
+    if holdout_path:
+        with open(holdout_path, encoding='utf-8') as f:
+            holdout = {path.normcase(path.normpath(l)) for l in filtered_trimmed_lines(f)}
+        before = len(file_list)
+        file_list = [f for f in file_list if path.normcase(path.normpath(f)) not in holdout]
+        logging.info(f'holdout: excluded {before - len(file_list):,} of {len(holdout):,} listed files')
     logging.info(f'file list size: {len(file_list):,}')
 
     # deterministic train/valid split, independent of the per-epoch shuffling

@@ -502,6 +502,46 @@ impl PlayerState {
         shanten::calc_all(&self.tehai, self.tehai_len_div3)
     }
 
+    /// Per-discard single-player EVs, aligned to the discard action space
+    /// (0..=36, akas at 34..=36). `NAN` marks tiles that are not keep-shanten
+    /// discard candidates or whose EV is not computed (shanten > 3).
+    ///
+    /// Returns `None` when the player cannot discard, has an accepted riichi
+    /// (no real choice), or the SP tables cannot be calculated at all.
+    ///
+    /// The SP calculator emits one candidate per tile kind; when the hand has
+    /// both an aka and a normal 5 it assumes the normal one is discarded, so
+    /// at most one of the pair {deaka, aka} slots is filled per state.
+    #[must_use]
+    pub fn sp_discard_evs(&self) -> Option<[f32; 37]> {
+        if !self.last_cans.can_discard || self.riichi_accepted[0] {
+            return None;
+        }
+        let SinglePlayerTables { max_ev_table } = self.single_player_tables().ok()?;
+
+        // The SP calculator works on the bare hand and knows nothing about
+        // kuikae or a declared riichi, so restrict to actually legal discards.
+        let legal = self.discard_candidates_aka();
+
+        let mut evs = [f32::NAN; 37];
+        let mut any = false;
+        for candidate in &max_ev_table {
+            // `calc_shanten_down` is off, so this is just a safety guard.
+            if candidate.shanten_down {
+                continue;
+            }
+            let tid = candidate.tile.as_usize();
+            if !legal[tid] {
+                continue;
+            }
+            if let Some(&ev) = candidate.exp_values.first() {
+                evs[tid] = ev;
+                any = true;
+            }
+        }
+        any.then_some(evs)
+    }
+
     /// Can be called at both 3n+1 and 3n+2, but `self.real_time_shanten` must
     /// be >= 0 and `self.tiles_left` must be >= 4.
     ///

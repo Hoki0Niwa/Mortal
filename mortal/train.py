@@ -24,6 +24,7 @@ def train():
     from torch.utils.tensorboard import SummaryWriter
     from common import submit_param, parameter_count, drain, filtered_trimmed_lines, tqdm
     from player import TestPlayer
+    from suite import run_suite
     from dataloader import FileDatasetsIter, worker_init_fn
     from lr_scheduler import LinearWarmUpCosineAnnealingLR
     from model import Brain, DQN, AuxNet
@@ -399,7 +400,9 @@ def train():
         else:
             player_names_set = set()
             for filename in config['dataset']['player_names_files']:
-                with open(filename) as f:
+                # utf-8-sig also strips the BOM some editors prepend; the default
+                # locale encoding (cp932) chokes on it or corrupts the first name
+                with open(filename, encoding='utf-8-sig') as f:
                     player_names_set.update(filtered_trimmed_lines(f))
             player_names = list(player_names_set)
             logging.info(f'loaded {len(player_names):,} players')
@@ -416,13 +419,26 @@ def train():
                 if len(player_names_set) > 0:
                     filtered = []
                     for filename in tqdm(file_list, unit='file'):
-                        with gzip.open(filename, 'rt') as f:
+                        with gzip.open(filename, 'rt', encoding='utf-8') as f:
                             start = json.loads(next(f))
                             if not set(start['names']).isdisjoint(player_names_set):
                                 filtered.append(filename)
                     file_list = filtered
                 file_list.sort(reverse=True)
                 torch.save({'file_list': file_list}, file_index)
+
+            # keep the benchmark-suite holdout files strictly out of training
+            # so their decision points stay uncontaminated for evaluation
+            holdout_path = config['dataset'].get('holdout_files', '')
+            if holdout_path:
+                with open(holdout_path, encoding='utf-8') as f:
+                    holdout = {path.normcase(path.normpath(l)) for l in filtered_trimmed_lines(f)}
+                before = len(file_list)
+                file_list = [f for f in file_list if path.normcase(path.normpath(f)) not in holdout]
+                excluded = before - len(file_list)
+                logging.info(f'holdout: excluded {excluded:,} of {len(holdout):,} listed files from training')
+                if excluded < len(holdout):
+                    logging.warning('some holdout entries did not match the training file list; check the paths')
         logging.info(f'file list size: {len(file_list):,}')
 
         before_next_test_play = (test_every - steps % test_every) % test_every
@@ -974,6 +990,9 @@ def train():
                     writer.add_scalar('test_play/fuuro_num', stat.avg_fuuro_num, steps)
                     writer.add_scalar('test_play/fuuro_point', stat.avg_fuuro_point, steps)
                     writer.flush()
+
+                    if config.get('suite', {}).get('enabled', False):
+                        run_suite(mortal, dqn, device, writer, steps)
 
                     if better:
                         # best_perf was mutated above, after the checkpoint was
