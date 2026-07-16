@@ -386,6 +386,42 @@ def train():
             'any': opp_riichi | opp_fuuro,
         }
 
+    # Replay-mix pool for online training (exp/online-replay-mix): human logs
+    # from [dataset] file_index/globs, minus holdout_files, plus the player
+    # name list. Built once per process, reused across drain cycles.
+    replay_pool_cache = None
+
+    def replay_pool():
+        nonlocal replay_pool_cache
+        if replay_pool_cache is not None:
+            return replay_pool_cache
+
+        names_set = set()
+        for filename in config['dataset']['player_names_files']:
+            # utf-8-sig also strips the BOM some editors prepend (see below)
+            with open(filename, encoding='utf-8-sig') as f:
+                names_set.update(filtered_trimmed_lines(f))
+
+        file_index = config['dataset']['file_index']
+        if path.exists(file_index):
+            pool = torch.load(file_index, weights_only=True)['file_list']
+        else:
+            pool = []
+            for pat in config['dataset']['globs']:
+                pool.extend(glob(pat, recursive=True))
+
+        holdout_path = config['dataset'].get('holdout_files', '')
+        if holdout_path:
+            with open(holdout_path, encoding='utf-8') as f:
+                holdout = {path.normcase(path.normpath(l)) for l in filtered_trimmed_lines(f)}
+            before = len(pool)
+            pool = [f for f in pool if path.normcase(path.normpath(f)) not in holdout]
+            logging.info(f'replay pool: excluded {before - len(pool):,} holdout files')
+
+        logging.info(f'replay pool: {len(pool):,} human logs, {len(names_set):,} player names')
+        replay_pool_cache = (pool, sorted(names_set))
+        return replay_pool_cache
+
     def train_epoch():
         nonlocal steps
         nonlocal idx
@@ -397,6 +433,23 @@ def train():
             dirname = drain()
             logging.info(f'drain wait: {time.monotonic() - t_drain:.1f}s')
             file_list = list(map(lambda p: path.join(dirname, p), os.listdir(dirname)))
+
+            # Phase D-(a): anchor online training by mixing human replays into
+            # every pass. replay_mix_ratio is the target fraction of files in
+            # the pass that are human logs (sample counts per file differ, so
+            # this is approximate). 0 = off, bit-identical to the old behavior.
+            mix_ratio = config['online'].get('replay_mix_ratio', 0)
+            if mix_ratio > 0:
+                mix_ratio = min(mix_ratio, 0.5)
+                pool, human_names = replay_pool()
+                num_mix = min(len(pool), round(len(file_list) * mix_ratio / (1 - mix_ratio)))
+                if num_mix > 0:
+                    file_list = file_list + random.sample(pool, num_mix)
+                    player_names = player_names + human_names
+                logging.info(
+                    f'replay mix: added {num_mix:,} human logs '
+                    f'({num_mix / len(file_list):.1%} of {len(file_list):,} files)'
+                )
         else:
             player_names_set = set()
             for filename in config['dataset']['player_names_files']:

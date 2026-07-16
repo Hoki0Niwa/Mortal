@@ -185,6 +185,15 @@ state_file = '/path/to/baseline.pth'
 [online]
 history_window = 50
 enable_compile = false
+# Phase D-(a) replay mixing (exp/online-replay-mix): mix human replays into
+# every online training pass to keep the value function anchored on the human
+# state distribution (the measured failure mode of plain online training is a
+# progressive, monotonic SP-EV/agreement drift after the CQL anchor is gone).
+# Value = target fraction of files per pass that are human logs (approximate;
+# per-file sample counts differ). Human logs come from [dataset]
+# file_index/globs filtered by player_names_files, minus holdout_files.
+# 0 = off (bit-identical to the old behavior). Clamped to <= 0.5.
+replay_mix_ratio = 0
 
 [online.remote]
 host = '127.0.0.1'
