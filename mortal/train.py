@@ -42,6 +42,11 @@ def train():
     test_games = config['test_play']['games']
     gate_sigma = config['test_play'].get('gate_sigma', 0.0)
     min_q_weight = config['cql']['min_q_weight']
+    # exp/online-replay-mix (a'): apply the offline CQL term (weighted by the
+    # same min_q_weight, which is otherwise unused online) to the human-origin
+    # samples of the online replay mix
+    replay_mix_cql = online and config.get('online', {}).get('replay_mix_cql', False) \
+        and config.get('online', {}).get('replay_mix_ratio', 0) > 0
     ol_cfg = config.get('offline_loss', {})
     huber_delta = ol_cfg.get('huber_delta', 0.0)
     awbc = ol_cfg.get('awbc', False)
@@ -250,6 +255,7 @@ def train():
         'train/logged_action_argmax_rate': 0,
         'train/policy_entropy': 0,
         'train/policy_entropy_norm': 0,
+        'train/replay_mix/anchor_sample_rate': 0,
         'train/awbc/adv_mean': 0,
         'train/awbc/adv_std': 0,
         'train/awbc/weight_std': 0,
@@ -427,6 +433,7 @@ def train():
         nonlocal idx
 
         player_names = []
+        anchor_files = None
         if online:
             player_names = ['trainee']
             t_drain = time.monotonic()
@@ -444,8 +451,11 @@ def train():
                 pool, human_names = replay_pool()
                 num_mix = min(len(pool), round(len(file_list) * mix_ratio / (1 - mix_ratio)))
                 if num_mix > 0:
-                    file_list = file_list + random.sample(pool, num_mix)
+                    mixed = random.sample(pool, num_mix)
+                    file_list = file_list + mixed
                     player_names = player_names + human_names
+                    if replay_mix_cql:
+                        anchor_files = set(mixed)
                 logging.info(
                     f'replay mix: added {num_mix:,} human logs '
                     f'({num_mix / len(file_list):.1%} of {len(file_list):,} files)'
@@ -507,6 +517,7 @@ def train():
             file_batch_size = file_batch_size,
             reserve_ratio = reserve_ratio,
             player_names = player_names,
+            anchor_files = anchor_files,
             num_epochs = num_epochs,
             enable_augmentation = enable_augmentation,
             augmented_first = augmented_first,
@@ -530,6 +541,10 @@ def train():
             nonlocal pb
             nonlocal metrics_batches
 
+            batch = list(batch)
+            # the anchor flag is only emitted when anchor_files was passed to
+            # the dataset, so the batch arity matches within each pass
+            is_anchor = batch.pop() if anchor_files is not None else None
             if use_oracle:
                 obs, invisible_obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks, at_turns, shantens = batch
             else:
@@ -546,6 +561,8 @@ def train():
             player_ranks = player_ranks.to(dtype=torch.int64, device=device, non_blocking=True)
             at_turns = at_turns.to(dtype=torch.float32, device=device, non_blocking=True)
             shantens = shantens.to(dtype=torch.int64, device=device, non_blocking=True)
+            if is_anchor is not None:
+                is_anchor = is_anchor.to(dtype=torch.bool, device=device, non_blocking=True)
             if invisible_obs is not None:
                 invisible_obs = invisible_obs.to(dtype=torch.float32, device=device, non_blocking=True)
             detailed_metrics = metrics_every <= 1 or steps % metrics_every == 0
@@ -587,6 +604,13 @@ def train():
                         cql_loss = (awbc_w * (q_out.logsumexp(-1) - q)).mean()
                     else:
                         cql_loss = q_out.logsumexp(-1).mean() - q.mean()
+                elif is_anchor is not None:
+                    # exp/online-replay-mix (a'): the human-origin samples get
+                    # the exact offline CQL treatment while the self-play part
+                    # of the stream contributes zero; dividing by the full
+                    # batch size keeps the per-sample gradient identical to
+                    # offline training
+                    cql_loss = ((q_out.logsumexp(-1) - q) * is_anchor.to(torch.float32)).mean()
 
                 next_rank_logits, = aux_net(phi)
                 next_rank_loss = ce(next_rank_logits, player_ranks)
@@ -600,7 +624,7 @@ def train():
 
             with torch.inference_mode():
                 stats['dqn_loss'] += dqn_loss
-                if not online:
+                if not online or is_anchor is not None:
                     stats['cql_loss'] += cql_loss
                 stats['next_rank_loss'] += next_rank_loss
                 all_q[idx] = q
@@ -650,6 +674,8 @@ def train():
                     metrics['train/logged_action_argmax_rate'] += (q_best_action == actions).to(torch.float32).mean()
                     metrics['train/policy_entropy'] += entropy.mean()
                     metrics['train/policy_entropy_norm'] += entropy_norm.mean()
+                    if is_anchor is not None:
+                        metrics['train/replay_mix/anchor_sample_rate'] += is_anchor.to(torch.float32).mean()
 
                     if awbc_w is not None:
                         w_metric = awbc_w.float()
@@ -868,7 +894,7 @@ def train():
                 all_td_1d = all_td.cpu().numpy().flatten()[::128]
 
                 writer.add_scalar('loss/dqn_loss', to_scalar(stats['dqn_loss'] / save_every), steps)
-                if not online:
+                if not online or replay_mix_cql:
                     writer.add_scalar('loss/cql_loss', to_scalar(stats['cql_loss'] / save_every), steps)
                 writer.add_scalar('loss/next_rank_loss', to_scalar(stats['next_rank_loss'] / save_every), steps)
                 writer.add_scalar('hparam/lr', scheduler.get_last_lr()[0], steps)
@@ -888,6 +914,8 @@ def train():
                     if version != 4 and tag.startswith('train/threat/'):
                         continue
                     if not awbc and tag.startswith('train/awbc/'):
+                        continue
+                    if not replay_mix_cql and tag.startswith('train/replay_mix/'):
                         continue
                     if not use_oracle and tag == 'train/awbc/baseline_unexplained_var':
                         continue

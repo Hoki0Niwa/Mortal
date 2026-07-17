@@ -51,7 +51,7 @@ libriichi（Rust）:
   → DataLoader → train_batch
 ```
 
-- サンプル = `(obs, action, mask, steps_to_done, kyoku_reward, player_rank, at_turn, shanten)`。`FileDatasetsIter(include_sp_labels=True)`（suite の sp_metrics 用、学習ではオフ）のときのみ末尾に 37 次元 SP 打牌 EV ベクトルが付く。この kwarg が False のときは `GameplayLoader` に `emit_sp_labels` を渡さないため、旧 pyd でも学習は動く
+- サンプル = `(obs, action, mask, steps_to_done, kyoku_reward, player_rank, at_turn, shanten)`。`FileDatasetsIter(include_sp_labels=True)`（suite の sp_metrics 用、学習ではオフ）のときのみ末尾に 37 次元 SP 打牌 EV ベクトルが付く。この kwarg が False のときは `GameplayLoader` に `emit_sp_labels` を渡さないため、旧 pyd でも学習は動く。`anchor_files=set(...)`（オンラインのリプレイ混合 + `replay_mix_cql` 用）のときのみ末尾に bool の起源フラグが付く（該当ファイル由来 = True。人間/自己対戦を別々にロードして付与するためローダの出力順に依存しない）
 - **同一局内の全着手は同じ kyoku_reward を受け取る**（局内のクレジット割り当てなし）
 - `dataset.holdout_files`（1行1パスのテキスト）に列挙したファイルは**学習から除外**され suite 専用になる。train.py / train_baseline.py の両方で normcase/normpath 突き合わせで除外（パス不一致時は warning）
 - **落とし穴**: buffer が file_batch_size=15（≈60局）単位のため、同一局のサンプル（ターゲット完全共有）が近接バッチに反復する。**回帰ヘッドの SGD 学習は丸暗記する**（C-1 実験で実証）。補助タスクを足すときは reserve_ratio > 0 / file_batch_size 増 / held-out 検証が必須

@@ -1,6 +1,6 @@
 # モデル性能改善ロードマップ
 
-最終更新: **2026-07-15**。前提知識は [architecture.md](architecture.md)、分析の根拠は [2026-07-10-review-and-training-notes.md](2026-07-10-review-and-training-notes.md)（以下 notes）。
+最終更新: **2026-07-17**。前提知識は [architecture.md](architecture.md)、分析の根拠は [2026-07-10-review-and-training-notes.md](2026-07-10-review-and-training-notes.md)（以下 notes）。
 
 原則: **計測ゲートを通った変更だけを main に残す**。新機能は config でデフォルトオフ（旧挙動 bit 同一）。1介入 = 1実験。成功/中止基準を事前に書く。
 
@@ -41,7 +41,8 @@
 | **AWBC**（advantage = return − V の指数重み BC） | 効果なし。advantage 分散の9割が除去不能ノイズのため、exp(adv/β) は実質「運の指数重み付け」になる（C-1 実験で機構が確定）。実装は残置（デフォルト off） |
 | **C-1 運補正ベースライン b(s, z)**（train_baseline.py） | 棚上げ。オラクル情報（山・全手牌）の R² 増分は +0.006 のみ（凍結トランク φ 単独 0.110 に対し）。2回の学習 + 閉形式 ridge プローブで決着。**副産物**: ①回帰ヘッドはこのパイプラインで丸暗記する（同一局ターゲットが近接バッチに反復）②凍結 φ は R²=0.11 の汎化信号を持つ ③ウォームスタート転移コード（第1conv ゼロ拡張、bit 一致検証済み）は補助タスクに再利用可 |
 | **critic / V ベースライン追加**（複数回） | 全て「無意味」化して失敗。理由は上と同根: V で条件付けしても除去できる分散がほぼない |
-| **オンラインでの CQL/BC 正則化** | 不採用（試行の結果） |
+| **オンラインでの CQL/BC 正則化** | 不採用（試行の結果）。※当時の試行は**自己対戦データへの**正則化。人間リプレイ混合サンプル限定の CQL（下記リプレイ混合の敗因が指す再挑戦形）は未試行 |
+| **リプレイ混合（データのみ・CQL なし、オンライン）** | **失敗（2026-07-17、メイン PC 30k step で中止基準抵触・即中止）**。開始 candidate_950000_offline（ev_loss_no_threat 14.54 / human_top1_no_threat 0.826 / margin 3.12）→ 最初の 5k step で 17.58 / 0.792 / 0.86、30k step（980k）で 22.77 / 0.697 / 0.31。**6/6 境界単調悪化**、劣化速度は旧錨なし run（1100k→1180k、80k で ev_loss +5.9）の約3倍、margin 崩壊は約10倍速。test_play も avg_ranking 2.493→2.536（SE 0.011、約4σ）/ avg_pt +0.7→−3.0 と 30k で可視 = 旧 run より質的に悪い。混合自体は作動（`logged_action_argmax_rate` 0.986→0.92 ≈ 人間サンプル2〜3割）。**敗因: オンライン損失に CQL 項がない（train.py `if not online:`）まま off-policy の人間打牌を素の MC 回帰したため**。オフラインの錨は「人間データ × CQL 保守項」の積であり、データ単独は錨にならないどころか、モデル argmax でない行動の Q を人間リターン側へ引き上げて CQL 由来のマージン構造を能動的に消去する（train margin 3.06→0.30、policy_entropy_norm 0.24→0.87 の方策平坦化）。実装は残置（`replay_mix_ratio`、デフォルト 0 = bit 同一）。**再挑戦条件: 人間由来サンプル限定の CQL 項とセット**（= 機構仮説 (a) の正しい検証形。Phase D 表参照） |
 | **対戦相手プール**（opponent_pool） | 不採用（試行の結果）。機能自体は残置（`opponent_pool_dir/prob`）。再挑戦時は「押しの成功体験の供給」という目的を明確化し suite のスタイル指標で監視すること |
 | **方策勾配版**（別リポジトリ `Mortal-P-Modtest`: offline AWR-BC → online PPO、critic なし） | オンラインで DQN 版より悪い。**敗因を suite_batch で定量化（2026-07-15）**: PPO 継続で `ev_loss_no_threat` 16.3→21.1（315k→765k）、向聴後退率 2 倍、advance_miss 0.041 — 牌効率の崩壊。なお policymodel（AWR-BC + ごく短い PPO）はオフライン同等のプロファイルを維持しており、既知の弱点（リーチ判断・七対子・トップ目進行）は現行 suite の死角（点数状況・手型スライス未実装）。系統識別: 20251007/20260205 online は policy ヘッドを checkpoint 検査で確認、315k/765k は時期・挙動から同系と推定 |
 | **bf16 重み化**（`weights_dtype='bfloat16'`） | 不採用。checkpoint 依存で行動一致率 0.9639（基準 0.995 未達）、速度益も +5-10% のみ |
@@ -106,7 +107,7 @@ Phase A で機構を観測してから着手（対策の選択は観測結果に
 
 | 機構仮説 | 対策候補 | 備考 |
 |---|---|---|
-| (a) CQL が切れて錨がない | リプレイ混合（人間牌譜を1〜2割、dataloader のファイルリスト混合で実装可） | **実験中（2026-07-16〜、ブランチ `exp/online-replay-mix`、メイン PC）**。`[online] replay_mix_ratio`（デフォルト 0 = bit 同一）。Phase A の機構観測（§1）が根拠。**成功基準**: オンライン 80k step で `sp/model_ev_loss_no_threat` が開始値 +1 点以内かつ帯上限 15.6 以内、`human_top1_no_threat` 低下 1pt 以内、test_play 悪化 gate_sigma 以内。**中止基準**: 1100k→1180k 型の単調上昇が 3 境界連続で再現、または behavior/* が許容帯外 |
+| (a) CQL が切れて錨がない | リプレイ混合（人間牌譜を1〜2割、dataloader のファイルリスト混合で実装可） | **第1回（データのみ混合）は失敗・中止（2026-07-17、§2 台帳参照）**: 30k step で ev_loss_no_threat 14.54→22.77、6/6 境界単調悪化。敗因はオンライン損失に CQL 項がないまま off-policy 回帰したこと = 錨は「データ × CQL」の積で、データ単独では逆効果。**次の一手 (a′)、実装済み（2026-07-17、`exp/online-replay-mix`）**: dataloader にサンプル起源フラグ（`anchor_files`）を通し、**人間由来サンプル限定で CQL 項**（オフラインと同じ `logsumexp − q`、重みは `[cql] min_q_weight` を流用）を掛けて再試行。`[online] replay_mix_cql = true` で opt-in（デフォルト false = bit 同一、実データでフラグ正確性・collate・旧経路の arity 不変を検証済み）。サンプル実混合率は `train/replay_mix/anchor_sample_rate` で監視。旧「オンライン CQL/BC 正則化」失敗との違い: 旧試行は自己対戦データへの正則化（自己方策の固着）、a′ は錨データにのみオフライン同一の保守項。成功・中止基準は第1回と同一（成功: 80k step で ev_loss_no_threat 開始 +1 以内かつ 15.6 以内、human_top1_no_threat 低下 1pt 以内、test_play 悪化 gate_sigma 以内 / 中止: 単調上昇 3 境界連続 or behavior 帯外） |
 | (b) 強 baseline 3人相手で押しの成功体験が構造的に不足 | プールに弱め・多様な相手を混ぜる | プール機能は失敗済み履歴あり。再挑戦するなら suite のスタイル指標で「押しへの正の credit」を確認しながら |
 | (c) 探索ほぼゼロ（ε=0.005/temp=0.05） | 一部ワーカーのみ探索強めプロファイル | TRAIN_PLAY_PROFILE で実装容易。ただし探索手がそのまま学習される問題あり（greedy フラグ未実装、§5 保留参照） |
 | (d) MC ターゲットの高分散 | duplicate ベースライン（同一山4席の平均を差し引く）または IQL 系ブートストラップ | C-1 の結論が指す「ターゲット側の変更」。工事は大きいが理論的裏付けが今回初めて得られた路線 |

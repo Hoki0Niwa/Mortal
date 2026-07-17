@@ -194,6 +194,16 @@ enable_compile = false
 # file_index/globs filtered by player_names_files, minus holdout_files.
 # 0 = off (bit-identical to the old behavior). Clamped to <= 0.5.
 replay_mix_ratio = 0
+# Phase D-(a') anchor loss (exp/online-replay-mix): apply the offline CQL term
+# to the human-origin samples of the replay mix only, weighted by [cql]
+# min_q_weight (otherwise unused online). The 2026-07-17 run showed that
+# mixing the data alone actively erases the CQL-induced Q-margin structure
+# (off-policy human actions are pulled toward human returns with nothing
+# holding the other actions down); with this flag the human part of the
+# stream is trained exactly like offline (dqn_loss + CQL) while the
+# self-play part keeps the old online loss. Requires replay_mix_ratio > 0.
+# false = off (bit-identical to the old behavior).
+replay_mix_cql = false
 
 [online.remote]
 host = '127.0.0.1'

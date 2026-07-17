@@ -22,6 +22,7 @@ class FileDatasetsIter(IterableDataset):
         enable_augmentation = False,
         augmented_first = False,
         include_sp_labels = False,
+        anchor_files = None,
     ):
         super().__init__()
         self.version = version
@@ -39,6 +40,10 @@ class FileDatasetsIter(IterableDataset):
         # as the last element of every entry; costs extra SP calculation in
         # the loader, so keep it off for training
         self.include_sp_labels = include_sp_labels
+        # when not None (a set of paths from file_list), every entry gets a
+        # trailing bool flag marking whether it came from one of these files
+        # (exp/online-replay-mix: human-anchor samples for the online CQL term)
+        self.anchor_files = anchor_files
         self.iterator = None
 
     def build_iter(self):
@@ -87,6 +92,19 @@ class FileDatasetsIter(IterableDataset):
         self.buffer.clear()
 
     def populate_buffer(self, file_list):
+        if self.anchor_files is None:
+            self.load_into_buffer(file_list, None)
+            return
+        # load the two origins separately instead of relying on the loader's
+        # output order matching the input file list
+        regular = [f for f in file_list if f not in self.anchor_files]
+        anchor = [f for f in file_list if f in self.anchor_files]
+        if regular:
+            self.load_into_buffer(regular, False)
+        if anchor:
+            self.load_into_buffer(anchor, True)
+
+    def load_into_buffer(self, file_list, is_anchor):
         data = self.loader.load_gz_log_files(file_list)
         for file in data:
             for game in file:
@@ -140,6 +158,8 @@ class FileDatasetsIter(IterableDataset):
                         entry.insert(1, invisible_obs[i])
                     if self.include_sp_labels:
                         entry.append(sp_ev_labels[i])
+                    if is_anchor is not None:
+                        entry.append(is_anchor)
                     self.buffer.append(entry)
 
     def __iter__(self):
