@@ -47,3 +47,7 @@
 - **行動種別の損失バランシング**: リーチ/鳴き/和了判断は打牌に比べ希少。oversampling は効く可能性があるが計測基盤が先
 - **scheduler.step() がマイクロバッチ毎**（`opt_step_every > 1` のとき LR がバッチ数で消化される）: 意図確認が必要な軽微事項
 - **エポック末尾の batch_size 未満の端数切り捨て**: 影響軽微、対応不要と判断
+
+## 失敗実験の記録
+
+- [SP 改造から SP3 までの実験・失敗記録](2026-07-21-sp-modification-through-sp3-failure-record.md) — SPCalculator 高速化、フルラベル評価、SPv2 補助教師、SP3 の速度・品質検証と中止理由。SPv2 / SP3 は廃止済み。
