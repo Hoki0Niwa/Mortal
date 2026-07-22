@@ -40,6 +40,8 @@ def log_react_stats(*engines):
             f"samples={stats['samples']:,}, avg_batch={stats['avg_batch']:.1f}, "
             f"max_batch={stats['max_batch']}"
         )
+        if stats['head_counts'] is not None:
+            logging.info(f"exploration heads [{engine.name}]: {stats['head_counts']}")
 
 class TestPlayer:
     def __init__(self):
@@ -146,6 +148,10 @@ class TrainPlayer:
         self.log_dir = path.abspath(cfg['log_dir'])
         self.train_key = secrets.randbits(64)
         self.train_seed = 10000
+        rl_cfg = config.get('online_rl', {})
+        self.ensemble_mode = (
+            'sample_per_game' if rl_cfg.get('sample_head_per_game', False) else 'mean'
+        )
 
         self.seed_count = cfg['games'] // 4
         self.boltzmann_epsilon = cfg['boltzmann_epsilon']
@@ -156,6 +162,11 @@ class TrainPlayer:
         self.repeat_counter = 0
 
         self.opponent_pool_dir = cfg.get('opponent_pool_dir', '')
+        if self.opponent_pool_dir == 'auto':
+            self.opponent_pool_dir = path.join(
+                path.dirname(config['control']['best_state_file']),
+                'candidates',
+            )
         self.opponent_pool_prob = cfg.get('opponent_pool_prob', 0.0)
 
     def _load_pool_opponent(self, device):
@@ -199,6 +210,8 @@ class TrainPlayer:
             enable_amp = True,
             amp_dtype = self.chal_amp_dtype,
             name = 'trainee',
+            ensemble_mode = self.ensemble_mode,
+            head_seed = self.train_key ^ self.train_seed,
             # the client's models are local inference copies, so weight
             # casting is safe here (load_state_dict re-casts on each update)
             **perf_engine_kwargs(allow_weights_cast=True),

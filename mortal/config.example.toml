@@ -56,6 +56,16 @@ repeats = 1
 opponent_pool_dir = ''          # past checkpoint directory (empty = disabled)
 opponent_pool_prob = 0.0        # probability of using pool opponent (0.0 = always baseline)
 
+# Value-based deep exploration for online self-play.  All defaults below keep
+# legacy Mortal behavior; enable them together only in an online experiment.
+[online_rl]
+bootstrapped_dqn = false         # true: train an ensemble of Q heads
+num_heads = 5
+prior_scale = 0.1               # fixed randomized-prior contribution to Q
+bootstrap_prob = 0.8            # probability that a sample trains each head
+sample_head_per_game = false    # true: hold one randomly chosen head for a whole hanchan
+reward_mode = 'kyoku_delta'     # 'kyoku_delta' or full-game 'hanchan_return'
+
 [test_play]
 games = 3000
 aggregate_runs = 1              # run N independent test-play batches per evaluation
@@ -152,6 +162,7 @@ sample_reuse_threshold = 0
 capacity = 1600
 force_sequential = false
 drain_min_count = 1             # do not drain until at least this many files are buffered
+reset_buffer_on_start = true    # false preserves queued replays across server restarts
 
 [1v3]
 seed_key = -1

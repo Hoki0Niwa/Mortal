@@ -26,7 +26,7 @@ def train():
     from player import TestPlayer
     from dataloader import FileDatasetsIter, worker_init_fn
     from lr_scheduler import LinearWarmUpCosineAnnealingLR
-    from model import Brain, DQN, AuxNet
+    from model import Brain, BootstrappedDQN, AuxNet, build_dqn, load_dqn_state_compat
     from libriichi.consts import obs_shape
     from config import config
 
@@ -48,6 +48,11 @@ def train():
     awbc_weight_clip = ol_cfg.get('awbc_weight_clip', 8.0)
     awbc_normalize = ol_cfg.get('awbc_normalize', True)
     awbc_log_clip = math.log(awbc_weight_clip) if awbc else 0.0
+    rl_cfg = config.get('online_rl', {})
+    bootstrapped_dqn = rl_cfg.get('bootstrapped_dqn', False)
+    sample_head_per_game = rl_cfg.get('sample_head_per_game', False)
+    bootstrap_prob = float(rl_cfg.get('bootstrap_prob', 0.8))
+    reward_mode = rl_cfg.get('reward_mode', 'kyoku_delta')
     next_rank_weight = config['aux']['next_rank_weight']
     metrics_every = config['control'].get('metrics_every', 1)
     async_save = config['control'].get('async_save', False)
@@ -74,8 +79,21 @@ def train():
     weight_decay = config['optim']['weight_decay']
     max_grad_norm = config['optim']['max_grad_norm']
 
+    if bootstrapped_dqn and not online:
+        raise ValueError('online_rl.bootstrapped_dqn is only supported in online training')
+    if sample_head_per_game and not bootstrapped_dqn:
+        raise ValueError('online_rl.sample_head_per_game requires bootstrapped_dqn')
+    if not 0 < bootstrap_prob <= 1:
+        raise ValueError('online_rl.bootstrap_prob must be in (0, 1]')
+    if reward_mode not in ('kyoku_delta', 'hanchan_return'):
+        raise ValueError(f'unknown online_rl.reward_mode: {reward_mode}')
+    if reward_mode != 'kyoku_delta' and not online:
+        raise ValueError('online_rl.reward_mode is only applied in online training')
+    if reward_mode == 'hanchan_return' and gamma != 1:
+        raise ValueError('online_rl.reward_mode = hanchan_return requires env.gamma = 1')
+
     mortal = Brain(version=version, **config['resnet']).to(device)
-    dqn = DQN(version=version).to(device)
+    dqn = build_dqn(version, config).to(device)
     aux_net = AuxNet((4,)).to(device)
     all_models = (mortal, dqn, aux_net)
     if enable_compile:
@@ -97,6 +115,8 @@ def train():
         to_decay = set()
         for mod_name, mod in model.named_modules():
             for name, param in mod.named_parameters(prefix=mod_name, recurse=False):
+                if not param.requires_grad:
+                    continue
                 params_dict[name] = param
                 if isinstance(mod, (nn.Linear, nn.Conv1d)) and name.endswith('weight'):
                     to_decay.add(name)
@@ -157,12 +177,18 @@ def train():
         timestamp = datetime.fromtimestamp(state['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
         logging.info(f'loaded: {timestamp}')
         mortal.load_state_dict(state['mortal'])
-        dqn.load_state_dict(state['current_dqn'])
+        dqn_load_kind = load_dqn_state_compat(dqn, state['current_dqn'])
+        logging.info(f'dqn checkpoint load: {dqn_load_kind}')
         aux_net.load_state_dict(state['aux_net'])
-        if not online or state['config']['control']['online']:
+        resume_optimizer = (
+            (not online or state['config']['control']['online'])
+            and dqn_load_kind != 'legacy-replicated'
+        )
+        if resume_optimizer:
             optimizer.load_state_dict(state['optimizer'])
             scheduler.load_state_dict(state['scheduler'])
-        scaler.load_state_dict(state['scaler'])
+        if dqn_load_kind != 'legacy-replicated':
+            scaler.load_state_dict(state['scaler'])
         best_perf = state['best_perf']
         steps = state['steps']
         if 'top_checkpoints' in state:
@@ -184,6 +210,13 @@ def train():
         logging.info(f'device: {device}')
 
     if online:
+        logging.info(
+            'online value learning: reward_mode=%s, bootstrapped_dqn=%s, '
+            'bootstrap_prob=%.3f',
+            reward_mode,
+            bootstrapped_dqn,
+            bootstrap_prob,
+        )
         submit_param(mortal, dqn, is_idle=True)
         logging.info('param has been submitted')
 
@@ -221,6 +254,8 @@ def train():
         'train/awbc/weight_std': 0,
         'train/awbc/clip_rate': 0,
         'train/awbc/ess': 0,
+        'train/ensemble/selected_q_std': 0,
+        'train/ensemble/greedy_disagreement_rate': 0,
         'train/action_rate/discard': 0,
         'train/action_rate/riichi': 0,
         'train/action_rate/chi': 0,
@@ -406,6 +441,7 @@ def train():
             num_epochs = num_epochs,
             enable_augmentation = enable_augmentation,
             augmented_first = augmented_first,
+            reward_mode = reward_mode if online else 'kyoku_delta',
         )
         data_loader = iter(DataLoader(
             dataset = file_data,
@@ -454,9 +490,43 @@ def train():
             awbc_adv = None
             with torch.autocast(device.type, dtype=amp_dtype, enabled=enable_amp):
                 phi = mortal(obs)
-                q_out = dqn(phi, masks)
-                q = q_out[range(batch_size), actions]
-                dqn_loss = q_criterion(q, q_target_mc)
+                q_heads = None
+                bootstrap_mask = None
+                if isinstance(dqn, BootstrappedDQN):
+                    q_heads = dqn.forward_heads(phi, masks)
+                    q_selected_heads = q_heads[
+                        torch.arange(batch_size, device=device)[:, None],
+                        torch.arange(dqn.num_heads, device=device)[None, :],
+                        actions[:, None],
+                    ]
+                    bootstrap_mask = torch.rand(
+                        (batch_size, dqn.num_heads), device=device
+                    ) < bootstrap_prob
+                    missing = ~bootstrap_mask.any(dim=1)
+                    if missing.any():
+                        fallback_heads = torch.randint(
+                            dqn.num_heads, (batch_size,), device=device
+                        )
+                        bootstrap_mask[missing, fallback_heads[missing]] = True
+                    target_heads = q_target_mc[:, None].expand_as(q_selected_heads)
+                    if huber_delta > 0:
+                        per_head_loss = nn.functional.huber_loss(
+                            q_selected_heads,
+                            target_heads,
+                            delta=huber_delta,
+                            reduction='none',
+                        )
+                    else:
+                        per_head_loss = 0.5 * (q_selected_heads - target_heads).square()
+                    dqn_loss = (
+                        per_head_loss * bootstrap_mask
+                    ).sum() / bootstrap_mask.sum()
+                    q_out = q_heads.mean(dim=1)
+                    q = q_selected_heads.mean(dim=1)
+                else:
+                    q_out = dqn(phi, masks)
+                    q = q_out[range(batch_size), actions]
+                    dqn_loss = q_criterion(q, q_target_mc)
                 cql_loss = 0
                 if not online:
                     if awbc:
@@ -512,6 +582,13 @@ def train():
                         entropy / max_entropy.clamp_min(1e-8),
                         torch.zeros_like(entropy),
                     )
+
+                    if q_heads is not None:
+                        selected_std = q_selected_heads.float().std(dim=1, unbiased=False)
+                        head_actions = q_heads.float().argmax(dim=-1)
+                        disagreement = (head_actions != head_actions[:, :1]).any(dim=1)
+                        metrics['train/ensemble/selected_q_std'] += selected_std.mean()
+                        metrics['train/ensemble/greedy_disagreement_rate'] += disagreement.float().mean()
 
                     metrics['train/reward_mean'] += reward.mean()
                     metrics['train/reward_std'] += reward.std(unbiased=False)
@@ -770,6 +847,8 @@ def train():
                     if version != 4 and tag.startswith('train/threat/'):
                         continue
                     if not awbc and tag.startswith('train/awbc/'):
+                        continue
+                    if not bootstrapped_dqn and tag.startswith('train/ensemble/'):
                         continue
                     writer.add_scalar(tag, to_scalar(value / max(1, metrics_batches)), steps)
 

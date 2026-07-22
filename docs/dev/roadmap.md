@@ -39,6 +39,16 @@
 - **TD(λ)/n-step + ターゲットネットワーク**: 局内のクレジット割り当て。オンラインで特に有効
 - **GRP の自己対戦データでの再学習**: 自己対戦が進むと報酬モデルが OOD になる。train_grp.py は既存
 
+### Valueベース深層探索 — `codex/online-deep-exploration` で実装
+
+- Bootstrapped DQN + fixed randomized prior
+- 半荘単位で一貫した head を使う探索（Rust batch agent から game index を渡す）
+- 現在局から終局までの順位効用差を使う `hanchan_return`
+- top-k candidates と初期 main checkpoint による population self-play
+- 旧単一 DQN checkpoint からの後方互換初期化、別PC用 seed/起動手順
+
+採否は [実験設計](online-deep-exploration.md) の固定 seed 評価ゲートで決める。
+
 ## 検討済み・保留の案（再調査不要）
 
 - **Oracle 蒸留**: `Brain(is_oracle=True)` と `take_invisible_obs()` のインフラは存在するが train.py 未使用。Suphx 流の蒸留は有望だが工事が大きい → Phase 3 以降

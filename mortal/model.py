@@ -243,6 +243,89 @@ class DQN(nn.Module):
         q = (v + a - a_mean).masked_fill(~mask, -torch.inf)
         return q
 
+class BootstrappedDQN(nn.Module):
+    """DQN ensemble with fixed randomized prior heads.
+
+    The trainable heads can be initialized from one legacy DQN checkpoint.
+    During training ``forward_heads`` exposes every bootstrap member.  Normal
+    inference uses their mean, while self-play can select one member for the
+    whole hanchan through ``head_ids``.
+    """
+
+    def __init__(self, *, version=1, num_heads=5, prior_scale=0.1):
+        super().__init__()
+        if num_heads < 2:
+            raise ValueError('BootstrappedDQN requires at least two heads')
+        if prior_scale < 0:
+            raise ValueError('prior_scale must be non-negative')
+        self.version = version
+        self.num_heads = num_heads
+        self.prior_scale = prior_scale
+        self.heads = nn.ModuleList(DQN(version=version) for _ in range(num_heads))
+        self.prior_heads = nn.ModuleList(DQN(version=version) for _ in range(num_heads))
+        self.prior_heads.requires_grad_(False)
+        self.prior_heads.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        # Randomized prior parameters are fixed and must never enter train mode.
+        self.prior_heads.eval()
+        return self
+
+    def forward_heads(self, phi, mask):
+        learned = torch.stack([head(phi, mask) for head in self.heads], dim=1)
+        if self.prior_scale == 0:
+            return learned
+        # Do not let a prior head update the shared representation through its
+        # contribution to the loss. Its own parameters are frozen as well.
+        with torch.no_grad():
+            prior = torch.stack([head(phi.detach(), mask) for head in self.prior_heads], dim=1)
+        return learned + self.prior_scale * prior
+
+    def forward(self, phi, mask, head_ids=None):
+        q_heads = self.forward_heads(phi, mask)
+        if head_ids is None:
+            return q_heads.mean(dim=1)
+        head_ids = torch.as_tensor(head_ids, dtype=torch.int64, device=phi.device)
+        if head_ids.ndim != 1 or head_ids.shape[0] != phi.shape[0]:
+            raise ValueError('head_ids must have shape [batch]')
+        return q_heads[torch.arange(phi.shape[0], device=phi.device), head_ids]
+
+    def initialize_heads_from_dqn(self, state_dict):
+        for head in self.heads:
+            head.load_state_dict(state_dict)
+
+
+def build_dqn(version, cfg=None):
+    """Build the configured value head without breaking legacy configs."""
+    rl_cfg = (cfg or {}).get('online_rl', {})
+    if rl_cfg.get('bootstrapped_dqn', False):
+        return BootstrappedDQN(
+            version=version,
+            num_heads=int(rl_cfg.get('num_heads', 5)),
+            prior_scale=float(rl_cfg.get('prior_scale', 0.1)),
+        )
+    return DQN(version=version)
+
+
+def load_dqn_state_compat(dqn, state_dict):
+    """Load both legacy scalar DQN and bootstrapped checkpoints.
+
+    A scalar checkpoint seeds every trainable bootstrap head.  Randomized prior
+    parameters intentionally keep their freshly sampled values on that first
+    conversion and are persisted by all subsequent checkpoints.
+    """
+    if isinstance(dqn, BootstrappedDQN):
+        if any(key.startswith('heads.') for key in state_dict):
+            dqn.load_state_dict(state_dict)
+            return 'bootstrapped'
+        dqn.initialize_heads_from_dqn(state_dict)
+        return 'legacy-replicated'
+    if any(key.startswith('heads.') for key in state_dict):
+        raise ValueError('bootstrapped checkpoint requires online_rl.bootstrapped_dqn = true')
+    dqn.load_state_dict(state_dict)
+    return 'legacy'
+
 class GRP(nn.Module):
     def __init__(self, hidden_size=64, num_layers=2):
         super().__init__()

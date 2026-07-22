@@ -1,11 +1,20 @@
 import json
 import logging
+import random
+import copy
 import traceback
 import torch
 import numpy as np
 from torch.distributions import Normal, Categorical
 from typing import *
-from model import Brain, DQN, CategoricalPolicy
+from model import (
+    Brain,
+    DQN,
+    BootstrappedDQN,
+    CategoricalPolicy,
+    build_dqn,
+    load_dqn_state_compat,
+)
 
 def resolve_amp_dtype(cfg_control):
     dtype_str = cfg_control.get('amp_dtype', 'float16')
@@ -33,6 +42,8 @@ class MortalEngine:
         buckets = None,
         use_cuda_graphs = False,
         graph_max_batch = 512,
+        ensemble_mode = 'mean',
+        head_seed = None,
     ):
         self.engine_type = 'mortal'
         self.device = device or torch.device('cpu')
@@ -52,6 +63,13 @@ class MortalEngine:
         self.boltzmann_epsilon = boltzmann_epsilon
         self.boltzmann_temp = boltzmann_temp
         self.top_p = top_p
+        if ensemble_mode not in ('mean', 'sample_per_game'):
+            raise ValueError(f'unknown ensemble_mode: {ensemble_mode}')
+        if ensemble_mode == 'sample_per_game' and not isinstance(self.dqn, BootstrappedDQN):
+            raise ValueError('sample_per_game requires BootstrappedDQN')
+        self.ensemble_mode = ensemble_mode
+        self._head_rng = random.Random(head_seed)
+        self._game_heads = {}
 
         # cast weights once instead of letting autocast re-cast all of them on
         # every react_batch call; this mutates the modules passed in, so never
@@ -72,6 +90,7 @@ class MortalEngine:
             use_cuda_graphs
             and self.bucket_batch
             and self.version != 1
+            and self.ensemble_mode == 'mean'
         )
         self.graph_max_batch = graph_max_batch
         self._staging_bufs = {}
@@ -82,29 +101,45 @@ class MortalEngine:
         self.react_max_batch = 0
 
     def react_batch(self, obs, masks, invisible_obs):
+        return self._react_batch_checked(obs, masks, invisible_obs, game_indices=None)
+
+    def react_batch_with_indices(self, obs, masks, invisible_obs, game_indices):
+        return self._react_batch_checked(obs, masks, invisible_obs, game_indices=game_indices)
+
+    def _react_batch_checked(self, obs, masks, invisible_obs, game_indices):
         try:
             with (
                 torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.enable_amp),
                 torch.inference_mode(),
             ):
-                return self._react_batch(obs, masks, invisible_obs)
+                return self._react_batch(obs, masks, invisible_obs, game_indices)
         except Exception as ex:
             raise Exception(f'{ex}\n{traceback.format_exc()}')
 
-    def _react_batch(self, obs, masks, invisible_obs):
+    def _react_batch(self, obs, masks, invisible_obs, game_indices=None):
         batch_size = len(obs)
         self.react_calls += 1
         self.react_samples += batch_size
         self.react_max_batch = max(self.react_max_batch, batch_size)
 
+        head_ids = None
+        if self.ensemble_mode == 'sample_per_game':
+            if game_indices is None or len(game_indices) != batch_size:
+                raise ValueError('sample_per_game inference requires one game index per observation')
+            head_ids = []
+            for game_idx in game_indices:
+                if game_idx not in self._game_heads:
+                    self._game_heads[game_idx] = self._head_rng.randrange(self.dqn.num_heads)
+                head_ids.append(self._game_heads[game_idx])
+
         if self.bucket_batch and invisible_obs is None:
-            q_out, masks = self._forward_bucketed(obs, masks, batch_size)
+            q_out, masks = self._forward_bucketed(obs, masks, batch_size, head_ids=head_ids)
         else:
             obs = torch.as_tensor(np.stack(obs, axis=0), device=self.device)
             masks = torch.as_tensor(np.stack(masks, axis=0), device=self.device)
             if invisible_obs is not None:
                 invisible_obs = torch.as_tensor(np.stack(invisible_obs, axis=0), device=self.device)
-            q_out = self._forward(obs, masks, invisible_obs)
+            q_out = self._forward(obs, masks, invisible_obs, head_ids=head_ids)
         q_out = q_out.float()
 
         if self.boltzmann_epsilon > 0:
@@ -118,7 +153,7 @@ class MortalEngine:
 
         return actions.tolist(), q_out.tolist(), masks.tolist(), is_greedy.tolist()
 
-    def _forward(self, obs, masks, invisible_obs=None):
+    def _forward(self, obs, masks, invisible_obs=None, head_ids=None):
         if self.infer_dtype is not None and obs.dtype != self.infer_dtype:
             obs = obs.to(self.infer_dtype)
             if invisible_obs is not None:
@@ -131,13 +166,19 @@ class MortalEngine:
                     latent = Normal(mu, logsig.exp() + 1e-6).sample()
                 else:
                     latent = mu
-                q_out = self.dqn(latent, masks)
+                if isinstance(self.dqn, BootstrappedDQN):
+                    q_out = self.dqn(latent, masks, head_ids=head_ids)
+                else:
+                    q_out = self.dqn(latent, masks)
             case 2 | 3 | 4:
                 phi = self.brain(obs)
-                q_out = self.dqn(phi, masks)
+                if isinstance(self.dqn, BootstrappedDQN):
+                    q_out = self.dqn(phi, masks, head_ids=head_ids)
+                else:
+                    q_out = self.dqn(phi, masks)
         return q_out
 
-    def _forward_bucketed(self, obs_list, mask_list, batch_size):
+    def _forward_bucketed(self, obs_list, mask_list, batch_size, head_ids=None):
         target = next((b for b in self.buckets if b >= batch_size), None)
         if target is None:
             target = 1 << (batch_size - 1).bit_length()
@@ -159,7 +200,11 @@ class MortalEngine:
             q_out = self._replay_graph(target, obs_buf, masks)
         if q_out is None:
             obs = obs_buf.to(self.device, non_blocking=True)
-            q_out = self._forward(obs, masks)
+            padded_head_ids = None
+            if head_ids is not None:
+                padded_head_ids = torch.zeros(target, dtype=torch.int64, device=self.device)
+                padded_head_ids[:batch_size] = torch.as_tensor(head_ids, device=self.device)
+            q_out = self._forward(obs, masks, head_ids=padded_head_ids)
         return q_out[:batch_size], masks[:batch_size]
 
     def _staging(self, name, rows, item_shape, dtype):
@@ -189,11 +234,17 @@ class MortalEngine:
     def take_react_stats(self):
         calls, samples, max_batch = self.react_calls, self.react_samples, self.react_max_batch
         self.react_calls = self.react_samples = self.react_max_batch = 0
+        head_counts = None
+        if isinstance(self.dqn, BootstrappedDQN) and self._game_heads:
+            head_counts = [0] * self.dqn.num_heads
+            for head_idx in self._game_heads.values():
+                head_counts[head_idx] += 1
         return {
             'calls': calls,
             'samples': samples,
             'avg_batch': samples / calls if calls > 0 else 0.,
             'max_batch': max_batch,
+            'head_counts': head_counts,
         }
 
 class _GraphRunner:
@@ -245,7 +296,7 @@ def build_engine_from_state(
     use_cuda_graphs=False,
     graph_max_batch=512,
 ):
-    cfg = state['config']
+    cfg = copy.deepcopy(state['config'])
     version = cfg['control'].get('version', 1)
     conv_channels = cfg['resnet']['conv_channels']
     num_blocks = cfg['resnet']['num_blocks']
@@ -266,15 +317,31 @@ def build_engine_from_state(
         raise ValueError('CategoricalPolicy does not support version 1 (latent dim mismatch)')
 
     brain = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks, norm=norm).eval()
-    head = CategoricalPolicy().eval() if is_policy else DQN(version=version).eval()
+    if is_policy:
+        head = CategoricalPolicy().eval()
+    else:
+        # Prefer the embedded config, then fall back to state-dict detection for
+        # early experimental checkpoints that predate the config key.
+        if any(key.startswith('heads.') for key in head_state):
+            rl_cfg = cfg.setdefault('online_rl', {})
+            rl_cfg['bootstrapped_dqn'] = True
+            rl_cfg['num_heads'] = 1 + max(
+                int(key.split('.')[1]) for key in head_state if key.startswith('heads.')
+            )
+        head = build_dqn(version, cfg).eval()
     brain.load_state_dict(brain_state)
-    head.load_state_dict(head_state)
+    if is_policy:
+        head.load_state_dict(head_state)
+    else:
+        load_dqn_state_compat(head, head_state)
 
     if enable_compile:
         brain.compile()
         head.compile()
 
-    head_kind = 'policy' if is_policy else 'dqn'
+    head_kind = 'policy' if is_policy else (
+        'bootstrapped_dqn' if isinstance(head, BootstrappedDQN) else 'dqn'
+    )
     engine = MortalEngine(
         brain,
         head,

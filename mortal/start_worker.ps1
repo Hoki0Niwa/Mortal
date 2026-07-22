@@ -4,14 +4,17 @@
 #   powershell -ExecutionPolicy Bypass -File start_worker.ps1
 #   powershell -ExecutionPolicy Bypass -File start_worker.ps1 -TrainPlayProfile second
 param(
-    [string]$TrainPlayProfile = 'default'
+    [string]$TrainPlayProfile = 'default',
+    [string]$PythonExe = 'python',
+    [string]$ConfigPath = (Join-Path $PSScriptRoot 'config.toml')
 )
 
-# Adjust these two paths on the main PC.
-$py  = 'C:\Users\user\miniconda3\envs\mortal\python.exe'
-$dir = 'C:\Users\user\git\Mortal\mortal'
+$py = $PythonExe
+$dir = $PSScriptRoot
+$cfg = (Resolve-Path -LiteralPath $ConfigPath).Path
 
 $host.UI.RawUI.WindowTitle = "mortal-worker-$TrainPlayProfile"
 $env:TRAIN_PLAY_PROFILE = $TrainPlayProfile
+$env:MORTAL_CFG = $cfg
 Set-Location $dir
 & $py "$dir\client.py"

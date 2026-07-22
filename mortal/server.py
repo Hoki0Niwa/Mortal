@@ -135,16 +135,33 @@ class Server(ThreadingTCPServer):
 def main():
     global S
     cfg = config['online']['server']
+    buffer_dir = path.abspath(cfg['buffer_dir'])
+    drain_dir = path.abspath(cfg['drain_dir'])
+    reset_buffer_on_start = cfg.get('reset_buffer_on_start', True)
+    if reset_buffer_on_start:
+        if path.isdir(buffer_dir):
+            shutil.rmtree(buffer_dir)
+        if path.isdir(drain_dir):
+            shutil.rmtree(drain_dir)
+    os.makedirs(buffer_dir, exist_ok=True)
+    os.makedirs(drain_dir, exist_ok=True)
+    buffer_list = os.listdir(buffer_dir)
+    existing_ids = []
+    for filename in buffer_list:
+        prefix, _, _ = filename.partition('_')
+        if prefix.isdigit():
+            existing_ids.append(int(prefix))
+
     S = State(
-        buffer_dir = path.abspath(cfg['buffer_dir']),
-        drain_dir = path.abspath(cfg['drain_dir']),
+        buffer_dir = buffer_dir,
+        drain_dir = drain_dir,
         capacity = cfg['capacity'],
         force_sequential = cfg['force_sequential'],
         drain_min_count = cfg.get('drain_min_count', 1),
         dir_lock = Lock(),
         param_lock = Lock(),
-        buffer_size = 0,
-        submission_id = 0,
+        buffer_size = len(buffer_list),
+        submission_id = max(existing_ids, default=-1) + 1,
         mortal_param = None,
         dqn_param = None,
         param_version = 0,
@@ -155,13 +172,6 @@ def main():
     # processes keep connecting via remote.host (127.0.0.1)
     bind_host = cfg.get('bind_host', config['online']['remote']['host'])
     bind_addr = (bind_host, config['online']['remote']['port'])
-    if path.isdir(S.buffer_dir):
-        shutil.rmtree(S.buffer_dir)
-    if path.isdir(S.drain_dir):
-        shutil.rmtree(S.drain_dir)
-    os.makedirs(S.buffer_dir)
-    os.makedirs(S.drain_dir)
-
     with Server(bind_addr, Handler, bind_and_activate=False) as server:
         server.allow_reuse_address = True
         server.daemon_threads = True

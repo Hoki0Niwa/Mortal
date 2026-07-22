@@ -7,6 +7,35 @@ from reward_calculator import RewardCalculator
 from libriichi.dataset import GameplayLoader
 from config import config
 
+def calculate_mc_targets(at_kyoku, dones, apply_gamma, kyoku_rewards, reward_mode):
+    """Return per-move MC rewards and discount distances.
+
+    ``kyoku_delta`` reproduces Mortal's original local objective.  In
+    ``hanchan_return`` every action receives the sum of placement-utility
+    deltas from its current kyoku through the end of the hanchan.  The sum
+    telescopes to terminal placement utility minus the GRP expectation at the
+    start of that kyoku, preserving the existing reward scale while exposing
+    cross-kyoku consequences.
+    """
+    game_size = len(at_kyoku)
+    if reward_mode == 'kyoku_delta':
+        reward_by_kyoku = np.asarray(kyoku_rewards)
+        terminal = np.asarray(dones, dtype=np.bool_)
+    elif reward_mode == 'hanchan_return':
+        reward_by_kyoku = np.cumsum(np.asarray(kyoku_rewards)[::-1])[::-1]
+        terminal = np.zeros(game_size, dtype=np.bool_)
+        if game_size:
+            terminal[-1] = True
+    else:
+        raise ValueError(f'unknown reward_mode: {reward_mode}')
+
+    rewards = reward_by_kyoku[np.asarray(at_kyoku, dtype=np.int64)]
+    steps_to_done = np.zeros(game_size, dtype=np.int64)
+    for i in reversed(range(game_size)):
+        if not terminal[i]:
+            steps_to_done[i] = steps_to_done[i + 1] + int(apply_gamma[i])
+    return rewards, steps_to_done
+
 class FileDatasetsIter(IterableDataset):
     def __init__(
         self,
@@ -21,6 +50,7 @@ class FileDatasetsIter(IterableDataset):
         num_epochs = 1,
         enable_augmentation = False,
         augmented_first = False,
+        reward_mode = 'kyoku_delta',
     ):
         super().__init__()
         self.version = version
@@ -34,6 +64,7 @@ class FileDatasetsIter(IterableDataset):
         self.num_epochs = num_epochs
         self.enable_augmentation = enable_augmentation
         self.augmented_first = augmented_first
+        self.reward_mode = reward_mode
         self.iterator = None
 
     def build_iter(self):
@@ -109,10 +140,13 @@ class FileDatasetsIter(IterableDataset):
                 rank_by_player_seq = (-scores_seq).argsort(-1, kind='stable').argsort(-1, kind='stable')
                 player_ranks = rank_by_player_seq[:, player_id]
 
-                steps_to_done = np.zeros(game_size, dtype=np.int64)
-                for i in reversed(range(game_size)):
-                    if not dones[i]:
-                        steps_to_done[i] = steps_to_done[i + 1] + int(apply_gamma[i])
+                mc_rewards, steps_to_done = calculate_mc_targets(
+                    at_kyoku,
+                    dones,
+                    apply_gamma,
+                    kyoku_rewards,
+                    self.reward_mode,
+                )
 
                 for i in range(game_size):
                     entry = [
@@ -120,7 +154,7 @@ class FileDatasetsIter(IterableDataset):
                         actions[i],
                         masks[i],
                         steps_to_done[i],
-                        kyoku_rewards[at_kyoku[i]],
+                        mc_rewards[i],
                         player_ranks[at_kyoku[i] + 1],
                         at_turns[i],
                         shantens[i],

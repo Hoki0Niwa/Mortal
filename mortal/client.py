@@ -7,7 +7,7 @@ import numpy as np
 import time
 import gc
 from os import path
-from model import Brain, DQN
+from model import Brain, build_dqn, load_dqn_state_compat
 from player import TrainPlayer
 from common import send_msg, recv_msg, UnexpectedEOF
 from config import config
@@ -20,7 +20,7 @@ def main():
     conv_channels = config['resnet']['conv_channels']
 
     mortal = Brain(version=version, num_blocks=num_blocks, conv_channels=conv_channels).to(device).eval()
-    dqn = DQN(version=version).to(device)
+    dqn = build_dqn(version, config).to(device)
     if config['online']['enable_compile']:
         mortal.compile()
         dqn.compile()
@@ -53,7 +53,7 @@ def main():
             time.sleep(3)
         param_wait_secs = time.monotonic() - t_wait
         mortal.load_state_dict(rsp['mortal'])
-        dqn.load_state_dict(rsp['dqn'])
+        load_dqn_state_compat(dqn, rsp['dqn'])
         logging.info(f'param has been updated (waited {param_wait_secs:.1f}s)')
 
         t_play = time.monotonic()

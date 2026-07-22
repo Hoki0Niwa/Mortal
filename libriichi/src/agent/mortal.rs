@@ -21,6 +21,7 @@ pub struct MortalBatchAgent {
     version: u32,
     enable_quick_eval: bool,
     enable_rule_based_agari_guard: bool,
+    indexed_react: bool,
     name: String,
     player_ids: Vec<u8>,
 
@@ -42,6 +43,7 @@ struct SyncFields {
     states: Vec<Array2<f32>>,
     invisible_states: Vec<Array2<f32>>,
     masks: Vec<Array1<bool>>,
+    game_indices: Vec<usize>,
     action_idxs: Vec<usize>,
     kan_action_idxs: Vec<Option<usize>>,
 }
@@ -50,28 +52,36 @@ impl MortalBatchAgent {
     pub fn new(engine: PyObject, player_ids: &[u8]) -> Result<Self> {
         ensure!(player_ids.iter().all(|&id| matches!(id, 0..=3)));
 
-        let (name, is_oracle, version, enable_quick_eval, enable_rule_based_agari_guard) =
-            Python::with_gil(|py| {
-                let obj = engine.bind_borrowed(py);
-                ensure!(
-                    obj.getattr("react_batch")?.is_callable(),
-                    "missing method react_batch",
-                );
+        let (
+            name,
+            is_oracle,
+            version,
+            enable_quick_eval,
+            enable_rule_based_agari_guard,
+            indexed_react,
+        ) = Python::with_gil(|py| {
+            let obj = engine.bind_borrowed(py);
+            ensure!(
+                obj.getattr("react_batch")?.is_callable(),
+                "missing method react_batch",
+            );
 
-                let name = obj.getattr("name")?.extract()?;
-                let is_oracle = obj.getattr("is_oracle")?.extract()?;
-                let version = obj.getattr("version")?.extract()?;
-                let enable_quick_eval = obj.getattr("enable_quick_eval")?.extract()?;
-                let enable_rule_based_agari_guard =
-                    obj.getattr("enable_rule_based_agari_guard")?.extract()?;
-                Ok((
-                    name,
-                    is_oracle,
-                    version,
-                    enable_quick_eval,
-                    enable_rule_based_agari_guard,
-                ))
-            })?;
+            let name = obj.getattr("name")?.extract()?;
+            let is_oracle = obj.getattr("is_oracle")?.extract()?;
+            let version = obj.getattr("version")?.extract()?;
+            let enable_quick_eval = obj.getattr("enable_quick_eval")?.extract()?;
+            let enable_rule_based_agari_guard =
+                obj.getattr("enable_rule_based_agari_guard")?.extract()?;
+            let indexed_react = obj.getattr("react_batch_with_indices").is_ok();
+            Ok((
+                name,
+                is_oracle,
+                version,
+                enable_quick_eval,
+                enable_rule_based_agari_guard,
+                indexed_react,
+            ))
+        })?;
 
         let size = player_ids.len();
         let quick_eval_reactions = if enable_quick_eval {
@@ -83,6 +93,7 @@ impl MortalBatchAgent {
             states: vec![],
             invisible_states: vec![],
             masks: vec![],
+            game_indices: vec![],
             action_idxs: vec![0; size],
             kan_action_idxs: vec![None; size],
         }));
@@ -93,6 +104,7 @@ impl MortalBatchAgent {
             version,
             enable_quick_eval,
             enable_rule_based_agari_guard,
+            indexed_react,
             name,
             player_ids: player_ids.to_vec(),
 
@@ -141,11 +153,21 @@ impl MortalBatchAgent {
                     .map(|v| PyArray2::from_owned_array(py, v))
                     .collect()
             });
+            let game_indices = mem::take(&mut sync_fields.game_indices);
 
-            let args = (states, masks, invisible_states);
-            self.engine
-                .bind_borrowed(py)
-                .call_method1(intern!(py, "react_batch"), args)
+            let engine = self.engine.bind_borrowed(py);
+            let result = if self.indexed_react {
+                engine.call_method1(
+                    intern!(py, "react_batch_with_indices"),
+                    (states, masks, invisible_states, game_indices),
+                )
+            } else {
+                engine.call_method1(
+                    intern!(py, "react_batch"),
+                    (states, masks, invisible_states),
+                )
+            };
+            result
                 .context("failed to execute `react_batch` on Python engine")?
                 .extract()
                 .context("failed to extract to Rust type")
@@ -266,6 +288,7 @@ impl BatchAgent for MortalBatchAgent {
                 states,
                 invisible_states,
                 masks,
+                game_indices,
                 action_idxs,
                 kan_action_idxs,
             } = &mut *sync_fields.lock();
@@ -273,6 +296,7 @@ impl BatchAgent for MortalBatchAgent {
                 kan_action_idxs[index] = Some(states.len());
                 states.push(kan_feature);
                 masks.push(kan_mask);
+                game_indices.push(index);
                 if let Some(invisible_state) = invisible_state.clone() {
                     invisible_states.push(invisible_state);
                 }
@@ -281,6 +305,7 @@ impl BatchAgent for MortalBatchAgent {
             action_idxs[index] = states.len();
             states.push(feature);
             masks.push(mask);
+            game_indices.push(index);
             if let Some(invisible_state) = invisible_state {
                 invisible_states.push(invisible_state);
             }

@@ -1,13 +1,19 @@
 # Launch the resident Mortal stack (server + trainer + client) on this PC.
 # Each process gets its own window with an auto-restart loop for 24/7 operation.
-# Run:  powershell -ExecutionPolicy Bypass -File start_all.ps1
+# Run: powershell -ExecutionPolicy Bypass -File start_all.ps1 -PythonExe python -ConfigPath .\config.toml
+param(
+    [string]$PythonExe = 'python',
+    [string]$ConfigPath = (Join-Path $PSScriptRoot 'config.toml')
+)
 
-$py  = 'C:\Users\user\miniconda3\envs\mortal\python.exe'
-$dir = 'C:\Users\user\git\Mortal\mortal'
+$py = $PythonExe
+$dir = $PSScriptRoot
+$cfg = (Resolve-Path -LiteralPath $ConfigPath).Path
 
 function Start-Loop {
     param([string]$Title, [string]$Script, [string]$Pre = '')
-    $cmd = "`$host.UI.RawUI.WindowTitle = '$Title'; $Pre while (`$true) { & '$py' '$Script'; Write-Host '[$Title] exited, restarting in 5s...'; Start-Sleep 5 }"
+    $envSetup = "`$env:MORTAL_CFG = '$cfg';"
+    $cmd = "`$host.UI.RawUI.WindowTitle = '$Title'; $envSetup $Pre while (`$true) { & '$py' '$Script'; Write-Host '[$Title] exited, restarting in 5s...'; Start-Sleep 5 }"
     Start-Process powershell -WorkingDirectory $dir -ArgumentList '-NoExit', '-Command', $cmd
 }
 

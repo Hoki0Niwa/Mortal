@@ -5,7 +5,7 @@ import sys
 import json
 import torch
 from datetime import datetime, timezone
-from model import Brain, DQN, GRP
+from model import Brain, GRP, build_dqn, load_dqn_state_compat
 from engine import MortalEngine
 from common import filtered_trimmed_lines
 from libriichi.mjai import Bot
@@ -39,9 +39,9 @@ def main():
         tag = f'mortal{version}-b{num_blocks}c{conv_channels}-t{time}'
 
     mortal = Brain(version=version, num_blocks=num_blocks, conv_channels=conv_channels).eval()
-    dqn = DQN(version=version).eval()
+    dqn = build_dqn(version, cfg).eval()
     mortal.load_state_dict(state['mortal'])
-    dqn.load_state_dict(state['current_dqn'])
+    load_dqn_state_compat(dqn, state['current_dqn'])
 
     engine = MortalEngine(
         mortal,

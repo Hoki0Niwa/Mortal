@@ -54,12 +54,15 @@ trainer (train.py online=true)          server.py              client.py ×N
 
 - ワーカーは trainee 1席 vs ベースライン3席（`opponent_pool_prob` で過去 checkpoint とも対戦）。探索は ε-Boltzmann（`[train_play]`）
 - オンラインでは **CQL 項なし**、trainee 席のデータのみ学習。`force_sequential` でほぼ on-policy 化
+- `[online_rl]` で Bootstrapped DQN を有効化すると、各サンプルを bootstrap mask で複数Q headへ割り当て、固定 randomized prior を加える。自己対戦は半荘ごとに一つの head を固定し、評価は head 平均
+- `reward_mode = 'hanchan_return'` は現在局から終局までの GRP 順位効用差を MC return として使う（詳細: [online-deep-exploration.md](online-deep-exploration.md)）
 - 既知バグ: test_play 後にハング → `sys.exit(0)` で再起動（train.py 末尾の `main()` が子プロセスを張り直す）
 
 ## Checkpoint 形式（state_file）
 
 dict keys: `mortal`（Brain）, `current_dqn`, `aux_net`, `optimizer`, `scheduler`, `scaler`, `steps`, `timestamp`, `best_perf`, `top_checkpoints`, `config`（**config 全体が埋め込まれる**）。
 `build_engine_from_state` はこの `config` と state dict の内容（BN統計の有無→norm 判定、`policy_net`/`current_dqn`→ヘッド判定）からエンジンを復元する。**後方互換を壊さないこと。**
+`current_dqn` は旧単一 DQN と Bootstrapped DQN の両方を読める。旧 DQN からオンライン開始する場合は全 trainable head に同じ重みを複製する。
 
 ## 評価系
 
